@@ -124,6 +124,21 @@ gpg --list-secret-keys   # confirm the GPG key is available
 pass ls                  # confirm password-store is accessible
 ```
 
+### Passage Backend
+
+When using the `passage` storage backend, Passless requires:
+
+- Read/write access to `~/.passage/store` (or `PASSAGE_DIR`)
+- Read access to the age identities file `~/.passage/identities` (or `PASSAGE_IDENTITIES_FILE`)
+- The `age` binary, plus any age plugin your identities or recipients use, on `PATH`
+- Git access if automatic synchronization is enabled (the store has a git remote)
+
+Verify:
+
+```bash
+passage ls               # confirm the passage store is accessible
+```
+
 ### TPM Backend
 
 When using the TPM 2.0 storage backend, Passless requires:

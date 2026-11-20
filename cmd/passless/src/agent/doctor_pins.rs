@@ -366,11 +366,12 @@ pub struct HumanStore {
 }
 
 impl HumanStore {
-    /// The credential directory of the configured backend (`local`, `pass` or `tpm`).
+    /// The credential directory of the configured backend (`local`, `pass`, `passage` or `tpm`).
     pub fn from_backend(backend: &BackendConfig) -> Self {
         let extension = match backend {
             BackendConfig::Local { .. } => "bin",
             BackendConfig::Pass { .. } => "gpg",
+            BackendConfig::Passage { .. } => "age",
             #[cfg(feature = "tpm")]
             BackendConfig::Tpm { .. } => "tpm",
         };

@@ -9,7 +9,8 @@ Passless is a software FIDO2 authenticator emulator written in Rust. It creates 
 **Key characteristics:**
 - Uses the `keylib` crate for FIDO2/CTAP protocol implementation
 - Operates as a roaming (cross-platform) authenticator over USB HID with resident key (passkey) support
-- Supports multiple storage backends: local filesystem, password-store (pass), and TPM 2.0
+- Supports multiple storage backends: local filesystem, password-store (pass), passage (age), and
+  TPM 2.0
 - Implements security hardening (mlock, core dump prevention)
 - Desktop notifications for user verification prompts
 
@@ -165,7 +166,7 @@ For detailed TPM and swtpm setup instructions, see:
 
 **Configuration** (`src/config/mod.rs`):
 - `AppConfig`: Main config structure with backend selection
-- `BackendConfig`: Enum for Local, Pass, or TPM backend
+- `BackendConfig`: Enum for Local, Pass, Passage, or TPM backend
 - `SecurityConfig`: Memory locking, core dump prevention
 - CLI args merged with TOML config (CLI takes precedence)
 - Default config location: `~/.config/passless/config.toml`
@@ -249,11 +250,13 @@ The authenticator is configured as a FIDO 2.1 roaming (USB HID) authenticator wi
 
 Configuration can be set via environment variables:
 - `PASSLESS_CONFIG`: Path to config file
-- `PASSLESS_BACKEND_TYPE`: "local", "pass", or "tpm"
+- `PASSLESS_BACKEND_TYPE`: "local", "pass", "passage", or "tpm"
 - `PASSLESS_LOCAL_PATH`: Local storage directory
 - `PASSLESS_PASS_STORE_PATH`: Password store path
 - `PASSLESS_PASS_PATH`: Relative path in password store (default: "fido2")
 - `PASSLESS_PASS_GPG_BACKEND`: "gpgme" or "gnupg-bin"
+- `PASSLESS_PASSAGE_STORE_PATH`, `PASSLESS_PASSAGE_PATH`, `PASSLESS_PASSAGE_IDENTITIES_FILE`,
+  `PASSLESS_PASSAGE_AGE_BINARY`: passage backend (defaults follow passage's `PASSAGE_*` variables)
 - `PASSLESS_TPM_PATH`: TPM storage directory
 - `PASSLESS_TPM_TCTI`: TPM TCTI configuration (e.g., "device:/dev/tpmrm0", "swtpm:path=/path/to/socket")
 - `PASSLESS_USE_MLOCK`: Enable memory locking (default: true)

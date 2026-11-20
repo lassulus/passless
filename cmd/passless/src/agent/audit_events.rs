@@ -672,15 +672,17 @@ impl AuditPayload {
 pub enum BackendKind {
     Local,
     Pass,
+    Passage,
     Tpm,
 }
 
 impl BackendKind {
-    /// The name audit records carry (`local`, `pass` or `tpm`).
+    /// The name audit records carry (`local`, `pass`, `passage` or `tpm`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
             Self::Pass => "pass",
+            Self::Passage => "passage",
             Self::Tpm => "tpm",
         }
     }

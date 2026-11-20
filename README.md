@@ -61,6 +61,7 @@ Users should choose the solution that best fits their own security and practical
 - PIN support with configurable enforcement policies
 - Storage backends:
   - [pass](https://www.passwordstore.org/) (encrypted, git-synced)
+  - [passage](https://github.com/FiloSottile/passage) (age-encrypted, git-synced)
   - TPM 2.0 (Experimental), including a [portable TPM backend](docs/TPM_PORTABLE.md)
     with TPM-resident non-exportable keys syncable across devices via a recovery seed
   - Local filesystem (testing only)
@@ -266,6 +267,27 @@ A `same-user` agent shares the human backend and follows `[pass]`. See
 [agent storage configuration](docs/agents/configuration.md#same-user-and-isolated-storage) for details.
 Because a Git push publishes all reachable commits, use **separate Git repositories**
 for human and isolated-agent stores when you need strict push isolation.
+
+### passage (age) backend
+
+`backend_type = "passage"` keeps passkeys in a [passage](https://github.com/FiloSottile/passage)
+store instead: the same layout as `pass` (`fido2/<rp-id>/<credential-id>.age`), encrypted by
+calling the `age` binary like passage does, so age plugins (`age-plugin-se`,
+`age-plugin-yubikey`, ...) work unchanged.
+
+```toml
+backend_type = "passage"
+
+[passage]
+# Defaults follow passage: $PASSAGE_DIR, $PASSAGE_IDENTITIES_FILE and $PASSAGE_AGE, else these.
+store_path = "/home/user/.passage/store"
+identities_file = "/home/user/.passage/identities"
+age_binary = "age"
+```
+
+Recipients follow passage: `$PASSAGE_RECIPIENTS_FILE`, else `$PASSAGE_RECIPIENTS`, else the
+nearest `.age-recipients` up to the store root, else the identities file itself. `git_sync` and
+`git_auto_push` work as for `[pass]`. Isolated agent profiles do not support passage storage yet.
 
 ### Headless automatic interaction
 

@@ -1,7 +1,7 @@
-use crate::storage::index::load_credential_paths;
+use crate::storage::index::{CredentialIndexes, load_credential_paths};
 use crate::storage::pass::sync::PassGitSync;
 use crate::storage::pass::{
-    GpgBackend, PassStorageAdapter as InnerPassStorageAdapter, TEMP_FILE_EXCLUDE_PATTERN,
+    PassStorageAdapter as InnerPassStorageAdapter, StoreCrypto, temp_file_exclude_pattern,
 };
 use crate::storage::{CredentialFilter, CredentialStorage, RelyingPartyMetadata};
 use git2::{Oid, Repository};
@@ -25,7 +25,7 @@ struct RepositoryGeneration {
 /// The underlying pass adapter builds its index once during construction and
 /// updates it for writes performed through that adapter. External `git pull`,
 /// checkout, or direct credential-file changes bypass those update hooks. This
-/// wrapper tracks the Git HEAD plus a cheap metadata fingerprint of `fido2/*.gpg`
+/// wrapper tracks the Git HEAD plus a cheap metadata fingerprint of `fido2/*.gpg` (`*.age`)
 /// files and recreates the underlying adapter whenever either changes.
 /// Recreating the adapter rescans credential paths without decrypting them and
 /// clears the decrypted credential cache, preventing stale file contents from
@@ -34,7 +34,7 @@ pub struct PassStorageAdapter {
     inner: InnerPassStorageAdapter,
     store_path: PathBuf,
     path: PathBuf,
-    gpg_backend: GpgBackend,
+    crypto: StoreCrypto,
     allow_create_without_prompt: bool,
     indexed_generation: RepositoryGeneration,
     sync: PassGitSync,
@@ -45,13 +45,13 @@ impl PassStorageAdapter {
     pub fn new_with_options(
         store_path: PathBuf,
         path: PathBuf,
-        gpg_backend: GpgBackend,
+        crypto: StoreCrypto,
         allow_create_without_prompt: bool,
     ) -> Result<Self> {
         Self::new_with_options_and_git_sync(
             store_path,
             path,
-            gpg_backend,
+            crypto,
             allow_create_without_prompt,
             true,
             true,
@@ -61,7 +61,7 @@ impl PassStorageAdapter {
     pub fn new_with_options_and_git_sync(
         store_path: PathBuf,
         path: PathBuf,
-        gpg_backend: GpgBackend,
+        crypto: StoreCrypto,
         allow_create_without_prompt: bool,
         git_sync: bool,
         git_auto_push: bool,
@@ -69,28 +69,27 @@ impl PassStorageAdapter {
         let inner = InnerPassStorageAdapter::new_with_options(
             store_path.clone(),
             path.clone(),
-            gpg_backend,
+            crypto.clone(),
             allow_create_without_prompt,
         )?;
-        let indexed_generation = repository_generation(&store_path, &path);
+        let indexed_generation = repository_generation(&store_path, &path, crypto.extension());
         let sync = PassGitSync::new(store_path.clone(), git_sync, git_auto_push);
 
         let mut adapter = Self {
             inner,
             store_path,
             path,
-            gpg_backend,
+            crypto,
             allow_create_without_prompt,
             indexed_generation,
             sync,
         };
 
         // Never let a Git-sync `git add .` stage a temporary file a crash left behind.
-        adapter
-            .sync
-            .ensure_local_exclude_pattern(TEMP_FILE_EXCLUDE_PATTERN);
+        let exclude_pattern = temp_file_exclude_pattern(adapter.crypto.extension());
+        adapter.sync.ensure_local_exclude_pattern(&exclude_pattern);
         adapter.sync.prepare_startup();
-        let generation = repository_generation(&adapter.store_path, &adapter.path);
+        let generation = adapter.repository_generation();
         if generation != adapter.indexed_generation {
             adapter.reload_from_repository(generation)?;
         }
@@ -102,6 +101,14 @@ impl PassStorageAdapter {
         self.sync.clone()
     }
 
+    fn repository_generation(&self) -> RepositoryGeneration {
+        repository_generation(&self.store_path, &self.path, self.crypto.extension())
+    }
+
+    fn rescan_credential_paths(&self) -> std::io::Result<CredentialIndexes> {
+        load_credential_paths(&self.store_path.join(&self.path), self.crypto.extension())
+    }
+
     fn reload_from_repository(&mut self, generation: RepositoryGeneration) -> Result<()> {
         debug!(
             "Reloading pass credential index after repository change: {:?} -> {:?}",
@@ -111,17 +118,17 @@ impl PassStorageAdapter {
         let inner = InnerPassStorageAdapter::new_with_options(
             self.store_path.clone(),
             self.path.clone(),
-            self.gpg_backend,
+            self.crypto.clone(),
             self.allow_create_without_prompt,
         )?;
         self.inner = inner;
         // The constructor may pull newer remote state, so sample again after it returns.
-        self.indexed_generation = repository_generation(&self.store_path, &self.path);
+        self.indexed_generation = self.repository_generation();
         Ok(())
     }
 
     fn refresh_if_repository_changed(&mut self) -> Result<()> {
-        let generation = repository_generation(&self.store_path, &self.path);
+        let generation = self.repository_generation();
         if generation != self.indexed_generation {
             self.reload_from_repository(generation)?;
         }
@@ -134,17 +141,17 @@ impl PassStorageAdapter {
     }
 
     fn record_current_generation(&mut self) {
-        self.indexed_generation = repository_generation(&self.store_path, &self.path);
+        self.indexed_generation = self.repository_generation();
     }
 
     fn current_credential_count(&self) -> usize {
         self.sync.prepare_if_needed();
-        let generation = repository_generation(&self.store_path, &self.path);
+        let generation = self.repository_generation();
         if generation == self.indexed_generation {
             return self.inner.count_credentials();
         }
 
-        load_credential_paths(&self.store_path.join(&self.path), "gpg")
+        self.rescan_credential_paths()
             .map(|indexes| indexes.id.len())
             .unwrap_or_else(|error| {
                 warn!(
@@ -162,11 +169,11 @@ impl PassStorageAdapter {
     // Read by the agent registration path only.
     #[cfg_attr(not(feature = "agent"), allow(dead_code))]
     fn current_count_for_rp(&self, rp_id: &str) -> Option<usize> {
-        let generation = repository_generation(&self.store_path, &self.path);
+        let generation = self.repository_generation();
         if generation == self.indexed_generation {
             return self.inner.count_for_rp(rp_id);
         }
-        match load_credential_paths(&self.store_path.join(&self.path), "gpg") {
+        match self.rescan_credential_paths() {
             Ok(indexes) => Some(indexes.count_for_rp(rp_id)),
             Err(error) => {
                 warn!(
@@ -264,11 +271,11 @@ impl CredentialStorage for PassStorageAdapter {
     }
 
     fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
-        let generation = repository_generation(&self.store_path, &self.path);
+        let generation = self.repository_generation();
         if generation == self.indexed_generation {
             return self.inner.indexed_credentials();
         }
-        match load_credential_paths(&self.store_path.join(&self.path), "gpg") {
+        match self.rescan_credential_paths() {
             Ok(indexes) => Some(indexes.credentials()),
             Err(error) => {
                 warn!(
@@ -295,10 +302,14 @@ impl CredentialStorage for PassStorageAdapter {
     }
 }
 
-fn repository_generation(store_path: &Path, credential_path: &Path) -> RepositoryGeneration {
+fn repository_generation(
+    store_path: &Path,
+    credential_path: &Path,
+    extension: &str,
+) -> RepositoryGeneration {
     RepositoryGeneration {
         head: repository_head(store_path),
-        credential_tree_stamp: credential_tree_stamp(&store_path.join(credential_path)),
+        credential_tree_stamp: credential_tree_stamp(&store_path.join(credential_path), extension),
     }
 }
 
@@ -309,7 +320,7 @@ fn repository_head(store_path: &Path) -> Option<Oid> {
     repository.head().ok()?.target()
 }
 
-fn credential_tree_stamp(root: &Path) -> u64 {
+fn credential_tree_stamp(root: &Path, extension: &str) -> u64 {
     let mut files = Vec::new();
     let Ok(rp_entries) = fs::read_dir(root) else {
         return 0;
@@ -326,7 +337,7 @@ fn credential_tree_stamp(root: &Path) -> u64 {
         };
         for credential in credentials.flatten() {
             let path = credential.path();
-            if path.extension().and_then(|value| value.to_str()) == Some("gpg") {
+            if path.extension().and_then(|value| value.to_str()) == Some(extension) {
                 files.push(path);
             }
         }
@@ -393,14 +404,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repository = Repository::init(temp.path()).unwrap();
         commit_file(&repository, Path::new("fido2/example.com/01.gpg"), b"first");
-        let first = repository_generation(temp.path(), Path::new("fido2"));
+        let first = repository_generation(temp.path(), Path::new("fido2"), "gpg");
 
         commit_file(
             &repository,
             Path::new("fido2/example.com/02.gpg"),
             b"second",
         );
-        let second = repository_generation(temp.path(), Path::new("fido2"));
+        let second = repository_generation(temp.path(), Path::new("fido2"), "gpg");
 
         assert_ne!(first.head, second.head);
         assert_ne!(first, second);
@@ -426,7 +437,7 @@ mod tests {
         let adapter = PassStorageAdapter::new_with_options_and_git_sync(
             temp.path().to_path_buf(),
             PathBuf::from("fido2"),
-            GpgBackend::GnupgBin,
+            StoreCrypto::Gpg(crate::storage::pass::GpgBackend::GnupgBin),
             true,
             false,
             false,
@@ -451,14 +462,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repository = Repository::init(temp.path()).unwrap();
         commit_file(&repository, Path::new("fido2/example.com/01.gpg"), b"first");
-        let first = repository_generation(temp.path(), Path::new("fido2"));
+        let first = repository_generation(temp.path(), Path::new("fido2"), "gpg");
 
         fs::write(
             temp.path().join("fido2/example.com/01.gpg"),
             b"changed payload with different length",
         )
         .unwrap();
-        let second = repository_generation(temp.path(), Path::new("fido2"));
+        let second = repository_generation(temp.path(), Path::new("fido2"), "gpg");
 
         assert_eq!(first.head, second.head);
         assert_ne!(first.credential_tree_stamp, second.credential_tree_stamp);
@@ -469,15 +480,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repository = Repository::init(temp.path()).unwrap();
         commit_file(&repository, Path::new("fido2/example.com/01.gpg"), b"first");
-        let first = repository_generation(temp.path(), Path::new("fido2"));
+        let first = repository_generation(temp.path(), Path::new("fido2"), "gpg");
 
         let added = temp.path().join("fido2/example.com/02.gpg");
         fs::write(&added, b"second").unwrap();
-        let second = repository_generation(temp.path(), Path::new("fido2"));
+        let second = repository_generation(temp.path(), Path::new("fido2"), "gpg");
         assert_ne!(first.credential_tree_stamp, second.credential_tree_stamp);
 
         fs::remove_file(added).unwrap();
-        let third = repository_generation(temp.path(), Path::new("fido2"));
+        let third = repository_generation(temp.path(), Path::new("fido2"), "gpg");
         assert_eq!(first.credential_tree_stamp, third.credential_tree_stamp);
     }
 }

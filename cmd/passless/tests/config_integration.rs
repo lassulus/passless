@@ -43,6 +43,46 @@ fn pass_git_auto_push_false_preserves_git_sync() {
     assert!(!config.pass.git_auto_push);
 }
 
+#[test]
+fn passage_section_resolves_to_the_passage_backend() {
+    let dir = tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        "backend_type = \"passage\"\n\
+         [passage]\n\
+         store_path = \"/srv/passage\"\n\
+         identities_file = \"/srv/identities\"\n\
+         git_auto_push = false\n",
+    );
+    let mut args = Args::try_parse_from([
+        "passless",
+        "--config-path",
+        &path.display().to_string(),
+        "--passage-age-binary",
+        "/opt/age/bin/age",
+    ])
+    .unwrap();
+    let config = AppConfig::load(&mut args).unwrap();
+
+    assert!(config.passage.git_sync);
+    assert!(!config.passage.git_auto_push);
+    assert!(config.pass.git_auto_push, "[pass] is independent");
+    match config.backend().unwrap() {
+        BackendConfig::Passage {
+            store_path,
+            path,
+            identities_file,
+            age_binary,
+        } => {
+            assert_eq!(store_path, "/srv/passage");
+            assert_eq!(path, "fido2");
+            assert_eq!(identities_file, "/srv/identities");
+            assert_eq!(age_binary, "/opt/age/bin/age");
+        }
+        other => panic!("expected the passage backend, got {other:?}"),
+    }
+}
+
 #[cfg(feature = "agent")]
 #[test]
 fn isolated_agent_has_independent_pass_git_configuration() {

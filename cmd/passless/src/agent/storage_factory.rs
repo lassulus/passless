@@ -11,7 +11,7 @@ use passless_core::agent::config::{AgentProfileConfig, BrowserScope};
 
 use crate::pin_storage::PinStorage;
 use crate::storage::CredentialStorage;
-use crate::storage::pass::GpgBackend;
+use crate::storage::pass::{GpgBackend, StoreCrypto};
 
 pub struct AgentStorageBundle {
     pub credential_storage: Arc<Mutex<Box<dyn CredentialStorage>>>,
@@ -296,11 +296,12 @@ pub fn create_storage_bundle_with_options(
             let gpg = gpg_backend.parse::<GpgBackend>().map_err(|e| {
                 Error::Storage(format!("invalid GPG backend '{}': {}", gpg_backend, e))
             })?;
+            let crypto = StoreCrypto::Gpg(gpg);
 
             let cred_storage = crate::storage::PassStorageAdapter::new_with_options_and_git_sync(
                 store_path.clone(),
                 PathBuf::from(path),
-                gpg,
+                crypto.clone(),
                 allow_create_without_prompt,
                 git_sync,
                 git_auto_push,
@@ -318,7 +319,7 @@ pub fn create_storage_bundle_with_options(
             let pin_storage = crate::pin_storage::PassPinStorage::new_with_sync(
                 store_path.clone(),
                 pin_path.clone(),
-                gpg,
+                crypto,
                 pass_sync,
             );
 

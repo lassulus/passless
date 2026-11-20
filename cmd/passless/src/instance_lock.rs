@@ -184,6 +184,7 @@ impl InstanceLock {
             match backend {
                 BackendConfig::Local { .. } => "local",
                 BackendConfig::Pass { .. } => "pass",
+                BackendConfig::Passage { .. } => "passage",
                 #[cfg(feature = "tpm")]
                 BackendConfig::Tpm { .. } => "tpm",
             },

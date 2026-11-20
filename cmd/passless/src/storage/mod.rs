@@ -41,11 +41,11 @@ use log::warn;
 ///   `read_first`.
 /// - Inside an adapter method (code the human path runs too), a credential file is written
 ///   atomically before the in-memory index is updated: `local` and `tpm` write a temporary file
-///   and rename it (`util::atomic_write_in_dir`), and `pass` has GnuPG encrypt to a temporary file
-///   in the same directory that is fsynced and renamed over the target
-///   (`pass::encrypt_with_gnupg_binary`; GnuPG's own `--output <target>` truncates in place and is
-///   not used on the target). The index is memory built from the files, never the other way round.
-///   A panic before the rename changes nothing; after it, at worst the index lacks the new
+///   and rename it (`util::atomic_write_in_dir`), and `pass`/`passage` have GnuPG/age encrypt to a
+///   temporary file in the same directory that is fsynced and renamed over the target
+///   (`pass::write_atomically`; GnuPG's `--output <target>` and age's `-o` truncate in place and
+///   are not used on the target). The index is memory built from the files, never the other way
+///   round. A panic before the rename changes nothing; after it, at worst the index lacks the new
 ///   credential until the next start. The `pass` and `tpm` backends also cache decrypted
 ///   credentials (the `local` backend has no cache): a panic after the rename can leave a cached
 ///   copy of the previous contents until `CREDENTIAL_CACHE_TTL` expires. None of these corrupts

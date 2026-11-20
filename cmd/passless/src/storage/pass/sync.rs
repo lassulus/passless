@@ -484,17 +484,12 @@ mod tests {
         fs::write(rp_dir.join(".tmp.4242.aa.gpg.new"), b"half").unwrap();
 
         let sync = PassGitSync::new(temp.path().to_path_buf(), true, false);
-        sync.ensure_local_exclude_pattern(crate::storage::pass::TEMP_FILE_EXCLUDE_PATTERN);
+        let pattern = crate::storage::pass::temp_file_exclude_pattern("gpg");
+        sync.ensure_local_exclude_pattern(&pattern);
         // Idempotent: the pattern is written once.
-        sync.ensure_local_exclude_pattern(crate::storage::pass::TEMP_FILE_EXCLUDE_PATTERN);
+        sync.ensure_local_exclude_pattern(&pattern);
         let exclude = fs::read_to_string(repo.path().join("info/exclude")).unwrap();
-        assert_eq!(
-            exclude
-                .lines()
-                .filter(|line| *line == crate::storage::pass::TEMP_FILE_EXCLUDE_PATTERN)
-                .count(),
-            1
-        );
+        assert_eq!(exclude.lines().filter(|line| *line == pattern).count(), 1);
 
         let mut index = repo.index().unwrap();
         index

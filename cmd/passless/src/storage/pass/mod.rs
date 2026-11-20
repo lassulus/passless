@@ -1,5 +1,9 @@
 //! Pass (password-store) storage adapter
+//!
+//! Also serves [passage](https://github.com/FiloSottile/passage) stores: the layout, indexing,
+//! Git sync and plaintext format are the same, only the encryption ([`StoreCrypto`]) differs.
 
+pub mod age;
 pub mod gpg_id;
 pub mod init;
 pub mod sync;
@@ -30,12 +34,12 @@ use zeroize::Zeroizing;
 
 /// Pass (password-store) storage adapter
 ///
-/// Stores credentials as GPG-encrypted files in a password store directory.
-/// Uses prs-lib for password store operations.
+/// Stores credentials as encrypted files in a password store directory: GPG for pass,
+/// age for passage (see [`StoreCrypto`]).
 pub struct PassStorageAdapter {
     store_path: PathBuf,
     path: PathBuf,
-    gpg_backend: GpgBackend,
+    crypto: StoreCrypto,
     indexes: CredentialIndexes,
     cache: CredentialCache,
     iteration_index: usize,
@@ -122,43 +126,80 @@ impl Display for GpgBackend {
     }
 }
 
+/// How the entries of a store are encrypted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreCrypto {
+    /// pass: GnuPG, `.gpg` files, `.gpg-id` recipients.
+    Gpg(GpgBackend),
+    /// passage: age, `.age` files, `.age-recipients` recipients.
+    Age(age::AgeCrypto),
+}
+
+impl StoreCrypto {
+    /// File extension of encrypted entries.
+    pub fn extension(&self) -> &'static str {
+        match self {
+            Self::Gpg(_) => "gpg",
+            Self::Age(_) => "age",
+        }
+    }
+}
+
+impl Display for StoreCrypto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gpg(backend) => backend.fmt(f),
+            Self::Age(age) => age.fmt(f),
+        }
+    }
+}
+
 impl PassStorageAdapter {
     pub fn new_with_options(
         store_path: PathBuf,
         path: PathBuf,
-        gpg_backend: GpgBackend,
+        crypto: StoreCrypto,
         allow_create_without_prompt: bool,
     ) -> Result<Self> {
         let allow_create_without_prompt = cfg!(debug_assertions) && allow_create_without_prompt;
-        info!("Using pass (password-store) backend");
         info!("Store path: {}", store_path.display());
         info!("Path: {}", path.display());
-        info!("GPG backend: {}", gpg_backend);
+        info!("Encryption: {}", crypto);
 
-        debug!("Opening password store at: {:?}", store_path);
+        match &crypto {
+            StoreCrypto::Gpg(gpg_backend) => {
+                info!("Using pass (password-store) backend");
+                debug!("Opening password store at: {:?}", store_path);
 
-        // Ensure the password store is initialized
-        // This will prompt the user via notifications if not initialized
-        self::init::ensure_initialized(
-            &store_path,
-            &path,
-            gpg_backend,
-            allow_create_without_prompt,
-        )?;
+                // Ensure the password store is initialized
+                // This will prompt the user via notifications if not initialized
+                self::init::ensure_initialized(
+                    &store_path,
+                    &path,
+                    *gpg_backend,
+                    allow_create_without_prompt,
+                )?;
 
-        if !store_path.exists() {
-            return Err(Error::Storage(format!(
-                "Password store path does not exist: {:?}",
-                store_path
-            )));
+                if !store_path.exists() {
+                    return Err(Error::Storage(format!(
+                        "Password store path does not exist: {:?}",
+                        store_path
+                    )));
+                }
+            }
+            StoreCrypto::Age(age) => {
+                // Like passage: the store directory is created by the first write, and the
+                // recipients come from `.age-recipients` (or the identities) at that time.
+                info!("Using passage backend");
+                age.ensure_identities()?;
+            }
         }
 
-        debug!("Using GPG backend: {:?}", gpg_backend);
-
+        let extension = crypto.extension();
         let mut adapter = Self {
             store_path,
             path,
-            gpg_backend,
+            crypto,
             indexes: Default::default(),
             cache: Default::default(),
             iteration_index: Default::default(),
@@ -166,11 +207,11 @@ impl PassStorageAdapter {
             decryption_affinity: HashMap::new(),
         };
 
-        // A crash between GnuPG and the rename leaves a temporary file behind.
-        remove_stale_temp_files(&adapter.get_fido2_path());
+        // A crash between the encryption and the rename leaves a temporary file behind.
+        remove_stale_temp_files(&adapter.get_fido2_path(), extension);
 
         // Load indexes by scanning directory structure (no decryption!)
-        adapter.indexes = load_credential_paths(&adapter.get_fido2_path(), "gpg")
+        adapter.indexes = load_credential_paths(&adapter.get_fido2_path(), extension)
             .map_err(|e| Error::Storage(format!("Failed to load credential paths: {}", e)))?;
 
         Ok(adapter)
@@ -208,12 +249,9 @@ impl PassStorageAdapter {
         }
     }
 
-    /// Create a crypto context based on the configured backend
+    /// Create a prs-lib GPG crypto context
     fn create_crypto_context(&self) -> Result<prs_lib::crypto::Context> {
-        let proto = match self.gpg_backend {
-            GpgBackend::Gpgme | GpgBackend::GnupgBin => prs_lib::crypto::Proto::Gpg,
-        };
-
+        let proto = prs_lib::crypto::Proto::Gpg;
         let config = prs_lib::crypto::Config::from(proto);
         debug!("Creating crypto context with protocol: {:?}", proto);
 
@@ -306,15 +344,17 @@ impl PassStorageAdapter {
         // If cache is full, evict oldest entry
         self.cache.evict_oldest_if_full();
 
-        // Read the encrypted GPG file
+        // Read the encrypted file
         let encrypted_data = std::fs::read(path).map_err(|e| {
             debug!("Failed to read encrypted file: {}", e);
             Error::Storage(format!("Failed to read file: {}", e))
         })?;
 
-        let plaintext = match self.gpg_backend {
-            GpgBackend::GnupgBin => self.decrypt_gnupg_with_affinity(path, &encrypted_data)?,
-            GpgBackend::Gpgme => {
+        let plaintext = match &self.crypto {
+            StoreCrypto::Gpg(GpgBackend::GnupgBin) => {
+                self.decrypt_gnupg_with_affinity(path, &encrypted_data)?
+            }
+            StoreCrypto::Gpg(GpgBackend::Gpgme) => {
                 let mut context = self.create_crypto_context()?;
                 let ciphertext = Ciphertext::from(encrypted_data);
                 let plaintext = context.decrypt(ciphertext).map_err(|e| {
@@ -323,6 +363,9 @@ impl PassStorageAdapter {
                 })?;
                 Zeroizing::new(plaintext.unsecure_ref().to_vec())
             }
+            StoreCrypto::Age(age) => age.decrypt(&encrypted_data).inspect_err(|e| {
+                error!("Failed to decrypt credential: {:?}", e);
+            })?,
         };
 
         debug!("Successfully decrypted credential");
@@ -369,7 +412,8 @@ impl PassStorageAdapter {
         let rp_id = validate_rp_id_for_storage(cred.rp.id.as_str())
             .map_err(|e| Error::Storage(format!("Invalid RP ID: {}", e)))?;
 
-        let path = get_credential_path(&self.get_fido2_path(), &rp_id, &cred.id, "gpg");
+        let extension = self.crypto.extension();
+        let path = get_credential_path(&self.get_fido2_path(), &rp_id, &cred.id, extension);
         debug!("Writing credential to: {:?}", path);
 
         // Ensure parent directory exists with secure permissions
@@ -380,11 +424,16 @@ impl PassStorageAdapter {
             })?;
         }
 
-        // Match pass exactly at the .gpg-id boundary: pass forwards each
-        // recipient selector to GnuPG as -r without requiring a hex key ID.
-        let (gpg_id_path, content) = self.find_nearest_gpg_id(&path)?;
-        let recipients = gpg_id::parse_gpg_id_selectors(&content, &gpg_id_path)?;
-        encrypt_with_gnupg_binary(Path::new("gpg"), &recipients, cred_bytes, &path)?;
+        match &self.crypto {
+            StoreCrypto::Gpg(_) => {
+                // Match pass exactly at the .gpg-id boundary: pass forwards each
+                // recipient selector to GnuPG as -r without requiring a hex key ID.
+                let (gpg_id_path, content) = self.find_nearest_gpg_id(&path)?;
+                let recipients = gpg_id::parse_gpg_id_selectors(&content, &gpg_id_path)?;
+                encrypt_with_gnupg_binary(Path::new("gpg"), &recipients, cred_bytes, &path)?;
+            }
+            StoreCrypto::Age(age) => age.encrypt_file(&self.store_path, cred_bytes, &path)?,
+        }
 
         debug!("Successfully wrote and encrypted credential");
 
@@ -392,7 +441,7 @@ impl PassStorageAdapter {
         self.cache.remove(&path);
 
         // Update all indexes using shared function
-        let path_info = CredentialPathInfo::new(rp_id, cred.id.to_vec(), "gpg".to_string());
+        let path_info = CredentialPathInfo::new(rp_id, cred.id.to_vec(), extension.to_string());
         update_indexes_on_write(&mut self.indexes, path_info);
 
         Ok(())
@@ -575,21 +624,28 @@ impl PassStorageAdapter {
     }
 }
 
-/// Encrypt `plaintext` to `output_path` atomically.
-///
-/// GnuPG's `--output <target>` truncates the target in place, so a crash, a kill or a panic in
-/// the middle of it would leave a truncated credential. The ciphertext goes to a temporary file
-/// in the same directory instead; it is fsynced, renamed over the target and the directory is
-/// fsynced, so a reader (and a recovered lock after a panic, ADR 0014 section 14) sees either the
-/// previous file or the complete new one. The temporary file ends in `.new`, so neither the
-/// credential index nor the repository stamp (both look for `.gpg`) ever picks it up, and a
-/// failure removes it.
+/// Encrypt `plaintext` to `output_path` atomically with GnuPG (see [`write_atomically`]).
 fn encrypt_with_gnupg_binary(
     binary: &Path,
     recipients: &[String],
     plaintext: &[u8],
     output_path: &Path,
 ) -> Result<()> {
+    write_atomically(output_path, |tmp_path| {
+        run_gnupg_encrypt(binary, recipients, plaintext, tmp_path)
+    })
+}
+
+/// Replace `output_path` atomically with what `encrypt` writes to the temporary path it gets.
+///
+/// GnuPG's `--output <target>` (like age's `-o`) truncates the target in place, so a crash, a
+/// kill or a panic in the middle of it would leave a truncated credential. The ciphertext goes to
+/// a temporary file in the same directory instead; it is fsynced, renamed over the target and the
+/// directory is fsynced, so a reader (and a recovered lock after a panic, ADR 0014 section 14)
+/// sees either the previous file or the complete new one. The temporary file ends in `.new`, so
+/// neither the credential index nor the repository stamp (both look for `.gpg`/`.age`) ever picks
+/// it up, and a failure removes it.
+fn write_atomically(output_path: &Path, encrypt: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     let parent = output_path.parent().ok_or_else(|| {
         Error::Storage(format!("No parent directory for {}", output_path.display()))
     })?;
@@ -599,18 +655,21 @@ fn encrypt_with_gnupg_binary(
         .ok_or_else(|| Error::Storage(format!("Invalid path {}", output_path.display())))?;
     let tmp_path = parent.join(temp_file_name(std::process::id(), file_name));
 
-    let result = run_gnupg_encrypt(binary, recipients, plaintext, &tmp_path)
-        .and_then(|()| publish_encrypted_file(&tmp_path, output_path, parent));
+    let result =
+        encrypt(&tmp_path).and_then(|()| publish_encrypted_file(&tmp_path, output_path, parent));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
     result
 }
 
-/// Gitignore pattern of the temporary files [`encrypt_with_gnupg_binary`] writes
-/// (`.tmp.<pid>.<credential>.gpg.new`). It goes into the repository's `info/exclude`, so the
-/// `git add .` of a Git-sync commit can never stage one that a crash left behind.
-pub(crate) const TEMP_FILE_EXCLUDE_PATTERN: &str = ".tmp.*.gpg.new";
+/// Gitignore pattern of the temporary files [`write_atomically`] writes for entries with
+/// `extension` (`.tmp.<pid>.<credential>.<extension>.new`). It goes into the repository's
+/// `info/exclude`, so the `git add .` of a Git-sync commit can never stage one that a crash left
+/// behind.
+pub(crate) fn temp_file_exclude_pattern(extension: &str) -> String {
+    format!(".tmp.*.{extension}.new")
+}
 
 /// Temporary files younger than this are kept by the stale-file cleanup: another process may be
 /// in the middle of a write.
@@ -620,25 +679,26 @@ fn temp_file_name(pid: u32, file_name: &str) -> String {
     format!(".tmp.{pid}.{file_name}.new")
 }
 
-/// Whether `name` is exactly a temporary file of [`encrypt_with_gnupg_binary`]:
-/// `.tmp.<digits>.<name>.gpg.new`.
-fn is_temp_file_name(name: &str) -> bool {
+/// Whether `name` is exactly a temporary file of [`write_atomically`] for an entry with
+/// `extension`: `.tmp.<digits>.<name>.<extension>.new`.
+fn is_temp_file_name(name: &str, extension: &str) -> bool {
     let Some(rest) = name.strip_prefix(".tmp.") else {
         return false;
     };
     let Some((pid, credential)) = rest.split_once('.') else {
         return false;
     };
+    let suffix = format!(".{extension}.new");
     !pid.is_empty()
         && pid.bytes().all(|b| b.is_ascii_digit())
-        && credential.len() > ".gpg.new".len()
-        && credential.ends_with(".gpg.new")
+        && credential.len() > suffix.len()
+        && credential.ends_with(&suffix)
 }
 
 /// Remove temporary files a crash left in the credential subtree: regular files named exactly as
 /// [`temp_file_name`] makes them, directly inside an RP directory of `fido2_path`, at least
 /// [`STALE_TEMP_MIN_AGE`] old. Nothing else is touched. Returns how many were removed.
-fn remove_stale_temp_files(fido2_path: &Path) -> usize {
+fn remove_stale_temp_files(fido2_path: &Path, extension: &str) -> usize {
     let mut removed = 0;
     let Ok(rp_dirs) = std::fs::read_dir(fido2_path) else {
         return 0;
@@ -655,7 +715,8 @@ fn remove_stale_temp_files(fido2_path: &Path) -> usize {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !is_temp_file_name(name) || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            if !is_temp_file_name(name, extension) || !entry.file_type().is_ok_and(|t| t.is_file())
+            {
                 continue;
             }
             let old_enough = entry
@@ -1063,7 +1124,7 @@ mod tests {
         PassStorageAdapter {
             store_path: store_root.to_path_buf(),
             path: PathBuf::from("fido2"),
-            gpg_backend: GpgBackend::GnupgBin,
+            crypto: StoreCrypto::Gpg(GpgBackend::GnupgBin),
             indexes: CredentialIndexes::default(),
             cache: CredentialCache::new(),
             iteration_index: 0,
@@ -1533,8 +1594,10 @@ printf plaintext
     #[test]
     fn only_the_exact_temp_file_names_are_recognized() {
         assert_eq!(temp_file_name(42, "ab12.gpg"), ".tmp.42.ab12.gpg.new");
-        assert!(is_temp_file_name(&temp_file_name(42, "ab12.gpg")));
-        assert!(is_temp_file_name(".tmp.1.x.gpg.new"));
+        assert!(is_temp_file_name(&temp_file_name(42, "ab12.gpg"), "gpg"));
+        assert!(is_temp_file_name(".tmp.1.x.gpg.new", "gpg"));
+        assert!(is_temp_file_name(&temp_file_name(42, "ab12.age"), "age"));
+        assert!(!is_temp_file_name(".tmp.1.x.gpg.new", "age"));
         for other in [
             "ab12.gpg",
             ".tmp.42.ab12.gpg",
@@ -1545,7 +1608,7 @@ printf plaintext
             ".reencrypt.42.ab12.gpg",
             ".tmp.42.ab12.gpg.new.bak",
         ] {
-            assert!(!is_temp_file_name(other), "{other}");
+            assert!(!is_temp_file_name(other, "gpg"), "{other}");
         }
     }
 
@@ -1587,7 +1650,7 @@ printf plaintext
         let link = rp.join(".tmp.4244.hh.gpg.new");
         std::os::unix::fs::symlink(&credential, &link).unwrap();
 
-        assert_eq!(remove_stale_temp_files(&fido2), 1);
+        assert_eq!(remove_stale_temp_files(&fido2, "gpg"), 1);
 
         assert!(!stale.exists());
         for kept in [

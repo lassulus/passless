@@ -36,6 +36,8 @@ use pin_storage::{LocalPinStorage, PassPinStorage, PinStorage};
 use shadow_rs::shadow;
 #[cfg(feature = "tpm")]
 use storage::TpmStorageAdapter;
+use storage::pass::StoreCrypto;
+use storage::pass::age::AgeCrypto;
 use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter};
 use worker::{UhidEndpoint, WorkerConfig, WorkerOutcome};
 
@@ -53,6 +55,33 @@ fn allow_e2e_storage_creation() -> bool {
     #[cfg(not(debug_assertions))]
     {
         false
+    }
+}
+
+/// Store root, credential path and encryption of a `pass` or `passage` backend: both use the
+/// password-store adapter and differ only in how entries are encrypted.
+fn pass_store(backend: &BackendConfig) -> Result<(String, String, StoreCrypto)> {
+    match backend {
+        BackendConfig::Pass {
+            store_path,
+            path,
+            gpg_backend,
+        } => Ok((
+            store_path.clone(),
+            path.clone(),
+            StoreCrypto::Gpg(gpg_backend.parse()?),
+        )),
+        BackendConfig::Passage {
+            store_path,
+            path,
+            identities_file,
+            age_binary,
+        } => Ok((
+            store_path.clone(),
+            path.clone(),
+            StoreCrypto::Age(AgeCrypto::new(age_binary.into(), identities_file.into())),
+        )),
+        _ => unreachable!("not a password-store backend"),
     }
 }
 
@@ -520,8 +549,10 @@ fn run() -> Result<()> {
         e
     })?;
 
-    let pass_git_sync = config.pass.git_sync;
-    let pass_git_auto_push = config.pass.git_auto_push;
+    let (pass_git_sync, pass_git_auto_push) = match &backend {
+        BackendConfig::Passage { .. } => (config.passage.git_sync, config.passage.git_auto_push),
+        _ => (config.pass.git_sync, config.pass.git_auto_push),
+    };
 
     #[cfg(feature = "agent")]
     let agent_enabled = config.agents.enabled;
@@ -640,16 +671,16 @@ fn run() -> Result<()> {
                     join_agent_runtime(agent_runtime);
                     result
                 }
-                BackendConfig::Pass {
-                    store_path,
-                    path,
-                    gpg_backend,
-                } => {
-                    let gpg_backend = gpg_backend.parse::<storage::pass::GpgBackend>()?;
+                BackendConfig::Pass { .. } | BackendConfig::Passage { .. } => {
+                    let backend_kind = match &backend {
+                        BackendConfig::Passage { .. } => agent::audit_events::BackendKind::Passage,
+                        _ => agent::audit_events::BackendKind::Pass,
+                    };
+                    let (store_path, path, crypto) = pass_store(&backend)?;
                     let storage = PassStorageAdapter::new_with_options_and_git_sync(
                         store_path.clone().into(),
                         path.clone().into(),
-                        gpg_backend,
+                        crypto.clone(),
                         allow_storage_creation,
                         pass_git_sync,
                         pass_git_auto_push,
@@ -660,7 +691,7 @@ fn run() -> Result<()> {
                     let pin_storage_inner = PassPinStorage::new_with_sync(
                         store_path.into(),
                         path.into(),
-                        gpg_backend,
+                        crypto,
                         pass_sync,
                     );
                     let boxed_pin: Box<dyn crate::pin_storage::PinStorage> =
@@ -678,7 +709,7 @@ fn run() -> Result<()> {
                         pin_storage.clone(),
                         operation_lock.clone(),
                         Arc::new(SoftwareCredentialKeyProvider),
-                        agent::audit_events::BackendKind::Pass,
+                        backend_kind,
                         config.agents.clone(),
                         security_config,
                         shutdown.clone(),
@@ -851,16 +882,12 @@ fn run() -> Result<()> {
                 )?;
                 run_with_service(service, uhid, shutdown)
             }
-            BackendConfig::Pass {
-                store_path,
-                path,
-                gpg_backend,
-            } => {
-                let gpg_backend = gpg_backend.parse::<storage::pass::GpgBackend>()?;
+            BackendConfig::Pass { .. } | BackendConfig::Passage { .. } => {
+                let (store_path, path, crypto) = pass_store(&backend)?;
                 let storage = PassStorageAdapter::new_with_options_and_git_sync(
                     store_path.clone().into(),
                     path.clone().into(),
-                    gpg_backend,
+                    crypto.clone(),
                     allow_storage_creation,
                     pass_git_sync,
                     pass_git_auto_push,
@@ -869,7 +896,7 @@ fn run() -> Result<()> {
                 let pin_storage = PassPinStorage::new_with_sync(
                     store_path.into(),
                     path.into(),
-                    gpg_backend,
+                    crypto,
                     pass_sync,
                 );
                 let pin_storage = Arc::new(Mutex::new(pin_storage));

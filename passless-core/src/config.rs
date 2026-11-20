@@ -120,6 +120,114 @@ pub struct PassBackendConfig {
     pub git_auto_push: bool,
 }
 
+/// passage's default for a path: `$<var>` if set and non-empty, else `~/<default>`.
+fn passage_env_or_home(var: &str, default: &str) -> String {
+    match std::env::var(var) {
+        Ok(value) if !value.is_empty() => value,
+        _ => dirs::home_dir()
+            .expect("Could not determine home directory: $HOME")
+            .join(default)
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
+/// Compute default passage store path: `$PASSAGE_DIR`, else `~/.passage/store`
+pub fn passage_store_path() -> String {
+    passage_env_or_home("PASSAGE_DIR", ".passage/store")
+}
+
+/// Compute default passage identities file: `$PASSAGE_IDENTITIES_FILE`, else
+/// `~/.passage/identities`
+pub fn passage_identities_file() -> String {
+    passage_env_or_home("PASSAGE_IDENTITIES_FILE", ".passage/identities")
+}
+
+/// Compute default age binary: `$PASSAGE_AGE`, else `age`
+pub fn passage_age_binary() -> String {
+    match std::env::var("PASSAGE_AGE") {
+        Ok(value) if !value.is_empty() => value,
+        _ => "age".to_string(),
+    }
+}
+
+/// Passage (age-encrypted password-store) backend configuration
+#[derive(ClapSerde, Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[group(id = "passage-backend-config")]
+pub struct PassageBackendConfig {
+    /// Path to passage store directory (default: $PASSAGE_DIR or ~/.passage/store)
+    #[arg(
+        long = "passage-store-path",
+        env = "PASSLESS_PASSAGE_STORE_PATH",
+        id = "passage-store-path",
+        value_name = "PATH"
+    )]
+    #[serde(default)]
+    #[default(passage_store_path())]
+    pub store_path: String,
+
+    /// Relative path within passage store for FIDO2 entries
+    #[arg(
+        long = "passage-path",
+        env = "PASSLESS_PASSAGE_PATH",
+        id = "passage-path",
+        value_name = "PATH"
+    )]
+    #[serde(default)]
+    #[default("fido2".to_string())]
+    pub path: String,
+
+    /// age identities file used for decryption (default: $PASSAGE_IDENTITIES_FILE or
+    /// ~/.passage/identities)
+    #[arg(
+        long = "passage-identities-file",
+        env = "PASSLESS_PASSAGE_IDENTITIES_FILE",
+        value_name = "PATH"
+    )]
+    #[serde(default)]
+    #[default(passage_identities_file())]
+    pub identities_file: String,
+
+    /// age binary (default: $PASSAGE_AGE or age)
+    #[arg(
+        long = "passage-age-binary",
+        env = "PASSLESS_PASSAGE_AGE_BINARY",
+        value_name = "PATH"
+    )]
+    #[serde(default)]
+    #[default(passage_age_binary())]
+    pub age_binary: String,
+
+    /// Automatically synchronize passage store Git around Passless operations
+    #[arg(
+        long = "passage-git-sync",
+        id = "passage-git-sync",
+        env = "PASSLESS_PASSAGE_GIT_SYNC",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(default)]
+    #[default(true)]
+    pub git_sync: bool,
+
+    /// Automatically push passage store Git commits to the remote (default: true).
+    /// When disabled, Git sync still pulls and commits changes locally.
+    #[arg(
+        long = "passage-git-auto-push",
+        id = "passage-git-auto-push",
+        env = "PASSLESS_PASSAGE_GIT_AUTO_PUSH",
+        action = ArgAction::Set,
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(default)]
+    #[default(true)]
+    pub git_auto_push: bool,
+}
+
 /// Compute default TPM storage path
 pub fn tpm_path() -> String {
     dirs::data_dir()
@@ -431,7 +539,7 @@ impl SecurityConfig {
 /// Note: Cannot derive Clone/Debug because it has #[clap_serde] fields
 #[derive(ClapSerde, Serialize, Deserialize, Debug, ConfigDoc)]
 pub struct AppConfig {
-    /// Storage backend type: pass, tpm (experimental), or local (for testing)
+    /// Storage backend type: pass, passage, tpm (experimental), or local (for testing)
     #[arg(short = 't', long = "backend-type", env = "PASSLESS_BACKEND_TYPE")]
     #[serde(default)]
     #[default("pass".to_string())]
@@ -456,6 +564,11 @@ pub struct AppConfig {
     #[clap_serde]
     #[command(flatten)]
     pub pass: PassBackendConfig,
+
+    /// Passage backend configuration
+    #[clap_serde]
+    #[command(flatten)]
+    pub passage: PassageBackendConfig,
 
     /// TPM backend configuration
     #[cfg(feature = "tpm")]
@@ -494,6 +607,12 @@ pub enum BackendConfig {
         store_path: String,
         path: String,
         gpg_backend: String,
+    },
+    Passage {
+        store_path: String,
+        path: String,
+        identities_file: String,
+        age_binary: String,
     },
     #[cfg(feature = "tpm")]
     Tpm {
@@ -549,6 +668,9 @@ impl BackendConfig {
             BackendConfig::Local { path } => Self::canonicalize_path(Path::new(path)),
             BackendConfig::Pass {
                 store_path, path, ..
+            }
+            | BackendConfig::Passage {
+                store_path, path, ..
             } => Self::canonicalize_path(&Path::new(store_path).join(path)),
             #[cfg(feature = "tpm")]
             BackendConfig::Tpm { path, .. } => Self::canonicalize_path(Path::new(path)),
@@ -560,6 +682,9 @@ impl BackendConfig {
         match self {
             BackendConfig::Local { path } => path.clone(),
             BackendConfig::Pass {
+                store_path, path, ..
+            }
+            | BackendConfig::Passage {
                 store_path, path, ..
             } => {
                 format!("{}/{}", store_path, path)
@@ -582,6 +707,9 @@ impl BackendConfig {
                 Ok(())
             }
             BackendConfig::Pass {
+                store_path, path, ..
+            }
+            | BackendConfig::Passage {
                 store_path, path, ..
             } => {
                 let p = Path::new(path);
@@ -686,6 +814,12 @@ impl AppConfig {
                 path: self.pass.path.clone(),
                 gpg_backend: self.pass.gpg_backend.clone(),
             }),
+            "passage" => Ok(BackendConfig::Passage {
+                store_path: self.passage.store_path.clone(),
+                path: self.passage.path.clone(),
+                identities_file: self.passage.identities_file.clone(),
+                age_binary: self.passage.age_binary.clone(),
+            }),
             #[cfg(feature = "tpm")]
             "tpm" => Ok(BackendConfig::Tpm {
                 path: self.tpm.path.clone(),
@@ -693,7 +827,7 @@ impl AppConfig {
                 portable: self.tpm.portable,
             }),
             _ => Err(crate::error::Error::Config(format!(
-                "Invalid backend_type '{}'. Must be one of: local, pass, tpm",
+                "Invalid backend_type '{}'. Must be one of: local, pass, passage, tpm",
                 self.backend_type
             ))),
         }

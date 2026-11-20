@@ -1,9 +1,9 @@
-//! Pass (password-store) PIN storage
+//! Pass (password-store) and passage PIN storage
 
 use crate::pin_storage::{
     PinStorage, SerializablePinConfig, SerializablePinRetries, SerializablePinState,
 };
-use crate::storage::pass::GpgBackend;
+use crate::storage::pass::StoreCrypto;
 use crate::storage::pass::gpg_id;
 use crate::storage::pass::sync::PassGitSync;
 use crate::util::create_secure_dir_all;
@@ -16,6 +16,7 @@ use std::sync::RwLock;
 use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
 use prs_lib::{Ciphertext, Plaintext};
+use zeroize::Zeroizing;
 
 const PIN_CONFIG_ENTRY: &str = "pin_state";
 const PIN_RETRIES_ENTRY: &str = "pin_retries.local";
@@ -32,13 +33,14 @@ struct SyncedConfig {
 
 /// Pass (password-store) PIN storage
 ///
-/// Stores PIN state as two GPG-encrypted entries in the password store:
+/// Stores PIN state as two encrypted entries in the password store (`.age` instead of `.gpg` for
+/// passage):
 /// - `pin_state.gpg`: PIN config (hash, min length, version) - synced to git
 /// - `pin_retries.local.gpg`: Retry counters (retries, uv_retries, locked_until) - local only
 pub struct PassPinStorage {
     store_path: PathBuf,
     fido2_path: PathBuf,
-    gpg_backend: GpgBackend,
+    crypto: StoreCrypto,
     sync: PassGitSync,
     /// Last known config state for change detection (for git sync optimization)
     last_config: RwLock<Option<SerializablePinConfig>>,
@@ -51,7 +53,7 @@ impl PassPinStorage {
     pub fn new_with_sync(
         store_path: PathBuf,
         fido2_path: PathBuf,
-        gpg_backend: GpgBackend,
+        crypto: StoreCrypto,
         sync: PassGitSync,
     ) -> Self {
         debug!(
@@ -62,7 +64,7 @@ impl PassPinStorage {
         let storage = Self {
             store_path,
             fido2_path,
-            gpg_backend,
+            crypto,
             sync,
             last_config: RwLock::new(None),
             last_synced: RwLock::new(None),
@@ -73,38 +75,62 @@ impl PassPinStorage {
         storage
     }
 
+    fn entry_path(&self, entry: &str) -> PathBuf {
+        self.store_path.join(&self.fido2_path).join(format!(
+            "{}.{}",
+            entry,
+            self.crypto.extension()
+        ))
+    }
+
     fn get_config_path(&self) -> PathBuf {
-        self.store_path
-            .join(&self.fido2_path)
-            .join(format!("{}.gpg", PIN_CONFIG_ENTRY))
+        self.entry_path(PIN_CONFIG_ENTRY)
     }
 
     fn get_retries_path(&self) -> PathBuf {
-        self.store_path
-            .join(&self.fido2_path)
-            .join(format!("{}.gpg", PIN_RETRIES_ENTRY))
+        self.entry_path(PIN_RETRIES_ENTRY)
     }
 
     fn get_legacy_retries_path(&self) -> PathBuf {
-        self.store_path
-            .join(&self.fido2_path)
-            .join(format!("{}.gpg", LEGACY_PIN_RETRIES_ENTRY))
+        self.entry_path(LEGACY_PIN_RETRIES_ENTRY)
     }
 
     fn create_crypto_context(&self) -> Result<prs_lib::crypto::Context> {
-        let proto = match self.gpg_backend {
-            GpgBackend::Gpgme | GpgBackend::GnupgBin => prs_lib::crypto::Proto::Gpg,
-        };
-
-        let config = prs_lib::crypto::Config::from(proto);
+        let config = prs_lib::crypto::Config::from(prs_lib::crypto::Proto::Gpg);
         prs_lib::crypto::context(&config).map_err(|e| {
             warn!("Failed to create crypto context: {:?}", e);
             Error::Storage(format!("Failed to create crypto context: {:?}", e))
         })
     }
 
-    fn resolve_recipients_for_target(&self, target: &Path) -> Result<prs_lib::Recipients> {
-        gpg_id::resolve_recipients_for_target(&self.store_path, target)
+    fn decrypt_entry(&self, encrypted_data: Vec<u8>) -> Result<Zeroizing<Vec<u8>>> {
+        match &self.crypto {
+            StoreCrypto::Gpg(_) => {
+                let mut context = self.create_crypto_context()?;
+                let plaintext = context
+                    .decrypt(Ciphertext::from(encrypted_data))
+                    .map_err(|e| Error::Storage(format!("{:?}", e)))?;
+                Ok(Zeroizing::new(plaintext.unsecure_ref().to_vec()))
+            }
+            StoreCrypto::Age(age) => age.decrypt(&encrypted_data),
+        }
+    }
+
+    fn encrypt_entry(&self, path: &Path, bytes: Vec<u8>) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            create_secure_dir_all(parent)
+                .map_err(|e| Error::Storage(format!("Failed to create directory: {}", e)))?;
+        }
+        match &self.crypto {
+            StoreCrypto::Gpg(_) => {
+                let recipients = gpg_id::resolve_recipients_for_target(&self.store_path, path)?;
+                let mut context = self.create_crypto_context()?;
+                context
+                    .encrypt_file(&recipients, Plaintext::from(bytes), path)
+                    .map_err(|e| Error::Storage(format!("{:?}", e)))
+            }
+            StoreCrypto::Age(age) => age.encrypt_file(&self.store_path, &bytes, path),
+        }
     }
 
     fn load_config(&self) -> std::result::Result<SerializablePinConfig, soft_fido2::StatusCode> {
@@ -122,18 +148,12 @@ impl PassPinStorage {
             soft_fido2::StatusCode::Other
         })?;
 
-        let mut context = self.create_crypto_context().map_err(|e| {
-            warn!("Failed to create crypto context: {:?}", e);
-            soft_fido2::StatusCode::Other
-        })?;
-
-        let ciphertext = Ciphertext::from(encrypted_data);
-        let plaintext = context.decrypt(ciphertext).map_err(|e| {
+        let plaintext = self.decrypt_entry(encrypted_data).map_err(|e| {
             warn!("Failed to decrypt PIN config: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
 
-        SerializablePinConfig::from_json_bytes(plaintext.unsecure_ref()).map_err(|e| {
+        SerializablePinConfig::from_json_bytes(&plaintext).map_err(|e| {
             warn!("Failed to parse PIN config: {:?}", e);
             soft_fido2::StatusCode::InvalidParameter
         })
@@ -159,18 +179,12 @@ impl PassPinStorage {
             soft_fido2::StatusCode::Other
         })?;
 
-        let mut context = self.create_crypto_context().map_err(|e| {
-            warn!("Failed to create crypto context: {:?}", e);
-            soft_fido2::StatusCode::Other
-        })?;
-
-        let ciphertext = Ciphertext::from(encrypted_data);
-        let plaintext = context.decrypt(ciphertext).map_err(|e| {
+        let plaintext = self.decrypt_entry(encrypted_data).map_err(|e| {
             warn!("Failed to decrypt PIN retries: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
 
-        SerializablePinRetries::from_json_bytes(plaintext.unsecure_ref()).map_err(|e| {
+        SerializablePinRetries::from_json_bytes(&plaintext).map_err(|e| {
             warn!("Failed to parse PIN retries: {:?}", e);
             soft_fido2::StatusCode::InvalidParameter
         })
@@ -186,30 +200,10 @@ impl PassPinStorage {
         let bytes = config.to_json_bytes()?;
 
         let path = self.get_config_path();
-        let recipients = self.resolve_recipients_for_target(&path).map_err(|e| {
-            warn!("Failed to load GPG recipients: {:?}", e);
+        self.encrypt_entry(&path, bytes).map_err(|e| {
+            warn!("Failed to encrypt PIN config: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
-
-        let mut context = self.create_crypto_context().map_err(|e| {
-            warn!("Failed to create crypto context: {:?}", e);
-            soft_fido2::StatusCode::Other
-        })?;
-
-        if let Some(parent) = path.parent() {
-            create_secure_dir_all(parent).map_err(|e| {
-                warn!("Failed to create directory: {}", e);
-                soft_fido2::StatusCode::Other
-            })?;
-        }
-
-        let plaintext = Plaintext::from(bytes);
-        context
-            .encrypt_file(&recipients, plaintext, &path)
-            .map_err(|e| {
-                warn!("Failed to encrypt PIN config: {:?}", e);
-                soft_fido2::StatusCode::Other
-            })?;
 
         self.sync.mark_dirty("Update Passless PIN configuration.");
 
@@ -230,30 +224,10 @@ impl PassPinStorage {
         let bytes = retries.to_json_bytes()?;
 
         let path = self.get_retries_path();
-        let recipients = self.resolve_recipients_for_target(&path).map_err(|e| {
-            warn!("Failed to load GPG recipients: {:?}", e);
+        self.encrypt_entry(&path, bytes).map_err(|e| {
+            warn!("Failed to encrypt PIN retries: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
-
-        let mut context = self.create_crypto_context().map_err(|e| {
-            warn!("Failed to create crypto context: {:?}", e);
-            soft_fido2::StatusCode::Other
-        })?;
-
-        if let Some(parent) = path.parent() {
-            create_secure_dir_all(parent).map_err(|e| {
-                warn!("Failed to create directory: {}", e);
-                soft_fido2::StatusCode::Other
-            })?;
-        }
-
-        let plaintext = Plaintext::from(bytes);
-        context
-            .encrypt_file(&recipients, plaintext, &path)
-            .map_err(|e| {
-                warn!("Failed to encrypt PIN retries: {:?}", e);
-                soft_fido2::StatusCode::Other
-            })?;
 
         debug!("PIN retries saved successfully (no git sync)");
         Ok(())
@@ -499,7 +473,7 @@ mod tests {
         let storage = PassPinStorage::new_with_sync(
             temp.path().to_path_buf(),
             PathBuf::from("fido2"),
-            GpgBackend::GnupgBin,
+            StoreCrypto::Gpg(crate::storage::pass::GpgBackend::GnupgBin),
             sync,
         );
 
@@ -525,7 +499,7 @@ mod tests {
         let storage = PassPinStorage::new_with_sync(
             temp.path().to_path_buf(),
             PathBuf::from("fido2"),
-            GpgBackend::GnupgBin,
+            StoreCrypto::Gpg(crate::storage::pass::GpgBackend::GnupgBin),
             sync,
         );
 
@@ -538,5 +512,35 @@ mod tests {
 
         retry_only.force_pin_change = true;
         assert!(storage.config_changed(&retry_only));
+    }
+
+    #[test]
+    #[ignore = "requires the age and age-keygen binaries"]
+    fn pin_configuration_round_trips_through_age() {
+        let temp = tempfile::tempdir().unwrap();
+        let identities = temp.path().join("identities");
+        let keygen = std::process::Command::new("age-keygen")
+            .arg("-o")
+            .arg(&identities)
+            .output()
+            .unwrap();
+        assert!(keygen.status.success());
+        let store = temp.path().join("store");
+        let storage = || {
+            PassPinStorage::new_with_sync(
+                store.clone(),
+                PathBuf::from("fido2"),
+                StoreCrypto::Age(crate::storage::pass::age::AgeCrypto::new(
+                    PathBuf::from("age"),
+                    identities.clone(),
+                )),
+                PassGitSync::new(store.clone(), false, false),
+            )
+        };
+
+        storage().save_config(&config()).unwrap();
+
+        assert!(store.join("fido2/pin_state.age").is_file());
+        assert_eq!(storage().load_config().unwrap().pin_hash, config().pin_hash);
     }
 }
