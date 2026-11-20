@@ -78,8 +78,37 @@ fn backup_state_for_export(
     Ok(CredentialBackupState::BackedUp)
 }
 
+const CTAP_MAKE_CREDENTIAL: u8 = 0x01;
 const CTAP_GET_ASSERTION: u8 = 0x02;
 const CRED_PROTECT_UV_REQUIRED: u8 = 0x03;
+
+/// The RP ID of a MakeCredential (`rp.id`, key 2) or GetAssertion (`rpId`, key 1) request.
+fn request_rp_id(request: &[u8]) -> Option<String> {
+    use ciborium::Value;
+
+    let (&command, params) = request.split_first()?;
+    let key = match command {
+        CTAP_MAKE_CREDENTIAL => 2,
+        CTAP_GET_ASSERTION => 1,
+        _ => return None,
+    };
+    let Value::Map(params) = ciborium::from_reader(params).ok()? else {
+        return None;
+    };
+    let (_, value) = params
+        .into_iter()
+        .find(|(k, _)| k.as_integer() == Some(key.into()))?;
+    match value {
+        Value::Text(rp_id) => Some(rp_id),
+        Value::Map(rp) => rp
+            .into_iter()
+            .find(|(k, _)| k.as_text() == Some("id"))?
+            .1
+            .into_text()
+            .ok(),
+        _ => None,
+    }
+}
 
 /// The parts of a GetAssertion request that decide whether it may be retried with built-in UV.
 struct GetAssertionUvView {
@@ -1631,7 +1660,10 @@ impl<
 
     /// Process a CTAP request and generate a response
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
+        let rp_id = request_rp_id(request);
+        lock_shared_storage(&self.storage).set_rp_hint(rp_id.as_deref());
         let result = self.handle_request(request, response_buffer);
+        lock_shared_storage(&self.storage).set_rp_hint(None);
         // soft-fido2 reports a CTAP error as a one-byte status response, not as an `Err`, so
         // inspect what is actually answered, whichever handler answered it.
         if result.is_ok() && is_uv_blocked_response(response_buffer) {
@@ -4814,5 +4846,47 @@ mod protected_credential_tests {
         assert_eq!(non_canonical[1], 0x01);
         non_canonical.splice(1..2, [0x18, 0x01]);
         assert!(GetAssertionUvView::without_uv(&non_canonical).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rp_hint_tests {
+    use super::request_rp_id;
+
+    use ciborium::Value;
+
+    fn request(command: u8, params: Vec<(Value, Value)>) -> Vec<u8> {
+        let mut bytes = vec![command];
+        ciborium::into_writer(&Value::Map(params), &mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn the_rp_id_of_make_credential_and_get_assertion_is_found() {
+        let rp = Value::Map(vec![
+            (Value::Text("id".into()), Value::Text("github.com".into())),
+            (Value::Text("name".into()), Value::Text("GitHub".into())),
+        ]);
+        let make = request(
+            0x01,
+            vec![
+                (Value::Integer(1.into()), Value::Bytes(vec![0; 32])),
+                (Value::Integer(2.into()), rp),
+            ],
+        );
+        assert_eq!(request_rp_id(&make).as_deref(), Some("github.com"));
+
+        let get = request(
+            0x02,
+            vec![
+                (Value::Integer(1.into()), Value::Text("webauthn.io".into())),
+                (Value::Integer(2.into()), Value::Bytes(vec![0; 32])),
+            ],
+        );
+        assert_eq!(request_rp_id(&get).as_deref(), Some("webauthn.io"));
+
+        assert_eq!(request_rp_id(&request(0x04, vec![])), None);
+        assert_eq!(request_rp_id(&[0x02, 0xff]), None);
+        assert_eq!(request_rp_id(&[]), None);
     }
 }

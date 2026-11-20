@@ -271,9 +271,13 @@ for human and isolated-agent stores when you need strict push isolation.
 ### passage (age) backend
 
 `backend_type = "passage"` keeps passkeys in a [passage](https://github.com/FiloSottile/passage)
-store instead: the same layout as `pass` (`fido2/<rp-id>/<credential-id>.age`), encrypted by
-calling the `age` binary like passage does, so age plugins (`age-plugin-se`,
-`age-plugin-yubikey`, ...) work unchanged.
+store instead, encrypted by calling the `age` binary like passage does, so age plugins
+(`age-plugin-se`, `age-plugin-yubikey`, ...) work unchanged.
+
+A passkey sits in its site's folder next to the site's other entries:
+`<path>/<rp-id>/passkey.age`, and `passkey-<first 8 hex chars of the credential ID>.age` for
+further accounts of the same site. Only `passkey.age` and `passkey-*.age` are read; other entries
+(`user.age`, `pass.age`, `otp.age`) are never decrypted or touched.
 
 ```toml
 backend_type = "passage"
@@ -283,6 +287,8 @@ backend_type = "passage"
 store_path = "/home/user/.passage/store"
 identities_file = "/home/user/.passage/identities"
 age_binary = "age"
+# Passkey root: www/github.com/passkey.age. Default "fido2"; "" puts site folders at the root.
+path = "www"
 ```
 
 Recipients follow passage: `$PASSAGE_RECIPIENTS_FILE`, else `$PASSAGE_RECIPIENTS`, else the

@@ -5,8 +5,8 @@ use crate::pin_storage::{
 };
 use crate::storage::pass::StoreCrypto;
 use crate::storage::pass::gpg_id;
+use crate::storage::pass::layout::ensure_entry_dir;
 use crate::storage::pass::sync::PassGitSync;
-use crate::util::create_secure_dir_all;
 
 use passless_core::error::{Error, Result};
 
@@ -118,7 +118,7 @@ impl PassPinStorage {
 
     fn encrypt_entry(&self, path: &Path, bytes: Vec<u8>) -> Result<()> {
         if let Some(parent) = path.parent() {
-            create_secure_dir_all(parent)
+            ensure_entry_dir(&self.crypto, parent)
                 .map_err(|e| Error::Storage(format!("Failed to create directory: {}", e)))?;
         }
         match &self.crypto {

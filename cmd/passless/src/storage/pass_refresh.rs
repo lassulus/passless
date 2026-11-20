@@ -1,4 +1,4 @@
-use crate::storage::index::{CredentialIndexes, load_credential_paths};
+use crate::storage::pass::layout::StoreIndex;
 use crate::storage::pass::sync::PassGitSync;
 use crate::storage::pass::{
     PassStorageAdapter as InnerPassStorageAdapter, StoreCrypto, temp_file_exclude_pattern,
@@ -38,6 +38,8 @@ pub struct PassStorageAdapter {
     allow_create_without_prompt: bool,
     indexed_generation: RepositoryGeneration,
     sync: PassGitSync,
+    /// Kept here too, so a reloaded inner adapter gets it back.
+    rp_hint: Option<String>,
 }
 
 impl PassStorageAdapter {
@@ -72,7 +74,7 @@ impl PassStorageAdapter {
             crypto.clone(),
             allow_create_without_prompt,
         )?;
-        let indexed_generation = repository_generation(&store_path, &path, crypto.extension());
+        let indexed_generation = repository_generation(&store_path, &path, &crypto);
         let sync = PassGitSync::new(store_path.clone(), git_sync, git_auto_push);
 
         let mut adapter = Self {
@@ -83,6 +85,7 @@ impl PassStorageAdapter {
             allow_create_without_prompt,
             indexed_generation,
             sync,
+            rp_hint: None,
         };
 
         // Never let a Git-sync `git add .` stage a temporary file a crash left behind.
@@ -102,11 +105,11 @@ impl PassStorageAdapter {
     }
 
     fn repository_generation(&self) -> RepositoryGeneration {
-        repository_generation(&self.store_path, &self.path, self.crypto.extension())
+        repository_generation(&self.store_path, &self.path, &self.crypto)
     }
 
-    fn rescan_credential_paths(&self) -> std::io::Result<CredentialIndexes> {
-        load_credential_paths(&self.store_path.join(&self.path), self.crypto.extension())
+    fn rescan_credential_paths(&self) -> std::io::Result<StoreIndex> {
+        StoreIndex::load(&self.store_path.join(&self.path), &self.crypto)
     }
 
     fn reload_from_repository(&mut self, generation: RepositoryGeneration) -> Result<()> {
@@ -122,6 +125,7 @@ impl PassStorageAdapter {
             self.allow_create_without_prompt,
         )?;
         self.inner = inner;
+        self.inner.set_rp_hint(self.rp_hint.as_deref());
         // The constructor may pull newer remote state, so sample again after it returns.
         self.indexed_generation = self.repository_generation();
         Ok(())
@@ -152,7 +156,7 @@ impl PassStorageAdapter {
         }
 
         self.rescan_credential_paths()
-            .map(|indexes| indexes.id.len())
+            .map(|index| index.count())
             .unwrap_or_else(|error| {
                 warn!(
                     "Failed to count credentials from changed repository state: {}",
@@ -174,7 +178,7 @@ impl PassStorageAdapter {
             return self.inner.count_for_rp(rp_id);
         }
         match self.rescan_credential_paths() {
-            Ok(indexes) => Some(indexes.count_for_rp(rp_id)),
+            Ok(index) => Some(index.count_for_rp(rp_id)),
             Err(error) => {
                 warn!(
                     "Failed to count credentials from changed repository state: {}",
@@ -276,7 +280,7 @@ impl CredentialStorage for PassStorageAdapter {
             return self.inner.indexed_credentials();
         }
         match self.rescan_credential_paths() {
-            Ok(indexes) => Some(indexes.credentials()),
+            Ok(index) => index.credentials(),
             Err(error) => {
                 warn!(
                     "Failed to list credentials from changed repository state: {}",
@@ -285,6 +289,11 @@ impl CredentialStorage for PassStorageAdapter {
                 None
             }
         }
+    }
+
+    fn set_rp_hint(&mut self, rp_id: Option<&str>) {
+        self.rp_hint = rp_id.map(str::to_owned);
+        self.inner.set_rp_hint(rp_id);
     }
 
     fn disable_user_verification(&self) -> bool {
@@ -305,11 +314,11 @@ impl CredentialStorage for PassStorageAdapter {
 fn repository_generation(
     store_path: &Path,
     credential_path: &Path,
-    extension: &str,
+    crypto: &StoreCrypto,
 ) -> RepositoryGeneration {
     RepositoryGeneration {
         head: repository_head(store_path),
-        credential_tree_stamp: credential_tree_stamp(&store_path.join(credential_path), extension),
+        credential_tree_stamp: credential_tree_stamp(&store_path.join(credential_path), crypto),
     }
 }
 
@@ -320,7 +329,7 @@ fn repository_head(store_path: &Path) -> Option<Oid> {
     repository.head().ok()?.target()
 }
 
-fn credential_tree_stamp(root: &Path, extension: &str) -> u64 {
+fn credential_tree_stamp(root: &Path, crypto: &StoreCrypto) -> u64 {
     let mut files = Vec::new();
     let Ok(rp_entries) = fs::read_dir(root) else {
         return 0;
@@ -337,7 +346,11 @@ fn credential_tree_stamp(root: &Path, extension: &str) -> u64 {
         };
         for credential in credentials.flatten() {
             let path = credential.path();
-            if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+            let name = credential.file_name();
+            if name
+                .to_str()
+                .is_some_and(|n| crypto.is_credential_file_name(n))
+            {
                 files.push(path);
             }
         }
@@ -364,6 +377,8 @@ mod tests {
     use super::*;
     use git2::Signature;
     use std::fs;
+
+    const GPG: StoreCrypto = StoreCrypto::Gpg(crate::storage::pass::GpgBackend::GnupgBin);
 
     fn commit_file(repository: &Repository, relative_path: &Path, contents: &[u8]) -> Oid {
         let workdir = repository.workdir().unwrap();
@@ -404,14 +419,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repository = Repository::init(temp.path()).unwrap();
         commit_file(&repository, Path::new("fido2/example.com/01.gpg"), b"first");
-        let first = repository_generation(temp.path(), Path::new("fido2"), "gpg");
+        let first = repository_generation(temp.path(), Path::new("fido2"), &GPG);
 
         commit_file(
             &repository,
             Path::new("fido2/example.com/02.gpg"),
             b"second",
         );
-        let second = repository_generation(temp.path(), Path::new("fido2"), "gpg");
+        let second = repository_generation(temp.path(), Path::new("fido2"), &GPG);
 
         assert_ne!(first.head, second.head);
         assert_ne!(first, second);
@@ -462,14 +477,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repository = Repository::init(temp.path()).unwrap();
         commit_file(&repository, Path::new("fido2/example.com/01.gpg"), b"first");
-        let first = repository_generation(temp.path(), Path::new("fido2"), "gpg");
+        let first = repository_generation(temp.path(), Path::new("fido2"), &GPG);
 
         fs::write(
             temp.path().join("fido2/example.com/01.gpg"),
             b"changed payload with different length",
         )
         .unwrap();
-        let second = repository_generation(temp.path(), Path::new("fido2"), "gpg");
+        let second = repository_generation(temp.path(), Path::new("fido2"), &GPG);
 
         assert_eq!(first.head, second.head);
         assert_ne!(first.credential_tree_stamp, second.credential_tree_stamp);
@@ -480,15 +495,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repository = Repository::init(temp.path()).unwrap();
         commit_file(&repository, Path::new("fido2/example.com/01.gpg"), b"first");
-        let first = repository_generation(temp.path(), Path::new("fido2"), "gpg");
+        let first = repository_generation(temp.path(), Path::new("fido2"), &GPG);
 
         let added = temp.path().join("fido2/example.com/02.gpg");
         fs::write(&added, b"second").unwrap();
-        let second = repository_generation(temp.path(), Path::new("fido2"), "gpg");
+        let second = repository_generation(temp.path(), Path::new("fido2"), &GPG);
         assert_ne!(first.credential_tree_stamp, second.credential_tree_stamp);
 
         fs::remove_file(added).unwrap();
-        let third = repository_generation(temp.path(), Path::new("fido2"), "gpg");
+        let third = repository_generation(temp.path(), Path::new("fido2"), &GPG);
         assert_eq!(first.credential_tree_stamp, third.credential_tree_stamp);
     }
 }

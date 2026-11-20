@@ -17,6 +17,8 @@ pub struct CredentialPathInfo {
     pub rp_id: ValidatedRpId,
     pub cred_id: Vec<u8>,
     pub extension: String,
+    /// The file name when it is not `<credential id hex>.<extension>` (passage passkey files).
+    pub file_name: Option<String>,
 }
 
 impl CredentialPathInfo {
@@ -25,7 +27,13 @@ impl CredentialPathInfo {
             rp_id,
             cred_id,
             extension,
+            file_name: None,
         }
+    }
+
+    pub fn with_file_name(mut self, file_name: String) -> Self {
+        self.file_name = Some(file_name);
+        self
     }
 
     pub fn from_path(path: &Path, extension: &str) -> Option<Self> {
@@ -47,15 +55,14 @@ impl CredentialPathInfo {
             }
         };
 
-        Some(Self {
-            rp_id,
-            cred_id,
-            extension: extension.to_string(),
-        })
+        Some(Self::new(rp_id, cred_id, extension.to_string()))
     }
 
     pub fn to_path(&self, base_dir: &Path) -> PathBuf {
-        get_credential_path(base_dir, &self.rp_id, &self.cred_id, &self.extension)
+        match &self.file_name {
+            Some(file_name) => base_dir.join(self.rp_id.as_str()).join(file_name),
+            None => get_credential_path(base_dir, &self.rp_id, &self.cred_id, &self.extension),
+        }
     }
 
     pub fn rp_id_hash(&self) -> [u8; 32] {

@@ -397,7 +397,7 @@ mod tests {
 
     fn sample_credential() -> soft_fido2::Credential {
         soft_fido2::Credential {
-            id: vec![0x0a, 0x0b, 0x0c, 0x0d],
+            id: vec![0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f],
             rp: soft_fido2_ctap::types::RelyingParty {
                 id: "example.com".to_string(),
                 name: Some("Example".to_string()),
@@ -439,82 +439,139 @@ mod tests {
         }
     }
 
-    /// A credential written through the backend with the real `age` binary reads back, is a plain
-    /// age file at `fido2/<rp>/<id-hex>.age` that `age -d` decrypts to the CBOR payload, and is
-    /// not readable with another identity.
+    fn open(store: &Path, root: &str, crypto: AgeCrypto) -> PassStorageAdapter {
+        PassStorageAdapter::new_with_options(
+            store.to_path_buf(),
+            PathBuf::from(root),
+            StoreCrypto::Age(crypto),
+            false,
+        )
+        .unwrap()
+    }
+
+    /// Passkeys written through the backend with the real `age` binary land in the site's folder
+    /// next to its other passage entries (`www/example.com/passkey.age`, then
+    /// `passkey-<8 hex>.age`), read back by credential ID, are plain age files that `age -d`
+    /// decrypts to the CBOR payload, and are not readable with another identity.
     #[test]
     #[ignore = "requires the age and age-keygen binaries"]
     fn round_trip_with_the_age_binary() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("store");
-        fs::create_dir_all(&store).unwrap();
+        let site = store.join("www/example.com");
+        fs::create_dir_all(&site).unwrap();
+        // The site's other entries: not age files, so decrypting one would fail the test.
+        fs::write(site.join("user.age"), b"alice").unwrap();
+        fs::write(site.join("pass.age"), b"hunter2").unwrap();
         let identities = dir.path().join("identities");
         let recipient = age_keygen(&identities);
         fs::write(store.join(AGE_RECIPIENTS_FILE), format!("{recipient}\n")).unwrap();
-        let store_crypto = StoreCrypto::Age(crypto(&identities));
 
-        let credential = sample_credential();
-        let mut adapter = PassStorageAdapter::new_with_options(
-            store.clone(),
-            PathBuf::from("fido2"),
-            store_crypto.clone(),
-            false,
-        )
-        .unwrap();
-        adapter.write(credential_ref(&credential)).unwrap();
+        let mut first = sample_credential();
+        let mut second = sample_credential();
+        second.id = vec![0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6];
+        second.user.name = Some("bob@example.com".to_string());
+        let mut adapter = open(&store, "www", crypto(&identities));
+        adapter.write(credential_ref(&first)).unwrap();
+        adapter.write(credential_ref(&second)).unwrap();
+        // An update rewrites the passkey's own file.
+        first.sign_count = 8;
+        adapter.write(credential_ref(&first)).unwrap();
 
-        let file = store.join("fido2/example.com/0a0b0c0d.age");
-        assert!(file.is_file());
+        let mut names: Vec<_> = fs::read_dir(&site)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "pass.age",
+                "passkey-a1b2c3d4.age",
+                "passkey.age",
+                "user.age"
+            ]
+        );
+        assert_eq!(fs::read(site.join("user.age")).unwrap(), b"alice");
+        assert_eq!(fs::read(site.join("pass.age")).unwrap(), b"hunter2");
+        let file = site.join("passkey.age");
         assert!(
             fs::read(&file)
                 .unwrap()
                 .starts_with(b"age-encryption.org/v1\n")
         );
 
-        // A fresh adapter indexes the file without decrypting and reads it back.
-        let mut reopened = PassStorageAdapter::new_with_options(
-            store.clone(),
-            PathBuf::from("fido2"),
-            store_crypto,
-            false,
-        )
-        .unwrap();
-        assert_eq!(reopened.count_credentials(), 1);
-        let read = reopened.read(&credential.id).unwrap();
+        // A fresh adapter indexes the files without decrypting.
+        let mut reopened = open(&store, "www", crypto(&identities));
+        assert_eq!(reopened.count_credentials(), 2);
+        assert_eq!(reopened.count_for_rp("example.com"), Some(2));
+        assert!(reopened.cache.is_empty());
+        // A lookup by ID during another site's request decrypts nothing and finds nothing.
+        reopened.set_rp_hint(Some("other.example"));
+        assert!(reopened.read(&second.id).is_err());
+        assert!(reopened.cache.is_empty());
+        // During the site's request, only its passkeys are decrypted.
+        reopened.set_rp_hint(Some("example.com"));
+        let read = reopened.read(&second.id).unwrap();
+        assert_eq!(read.user.name.as_deref(), Some("bob@example.com"));
+        let read = reopened.read(&first.id).unwrap();
         assert_eq!(read.rp.id, "example.com");
         assert_eq!(read.user.name.as_deref(), Some("alice@example.com"));
-        assert_eq!(read.sign_count, 7);
+        assert_eq!(read.sign_count, 8);
         assert_eq!(read.key.material.as_slice(), &[0x42; 32]);
+
+        // Deleting one account leaves the other's file.
+        reopened.delete(&first.id).unwrap();
+        assert!(!file.exists());
+        assert!(site.join("passkey-a1b2c3d4.age").is_file());
 
         // passage-compatible: age itself decrypts it to the backend's CBOR payload.
         let output = Command::new("age")
             .arg("-d")
             .arg("-i")
             .arg(&identities)
-            .arg(&file)
+            .arg(site.join("passkey-a1b2c3d4.age"))
             .output()
             .unwrap();
         assert!(output.status.success());
         let payload = crate::storage::credential::Credential::from_bytes(&output.stdout).unwrap();
-        assert_eq!(payload.id.as_ref(), &[0x0a, 0x0b, 0x0c, 0x0d]);
+        assert_eq!(payload.id.as_ref(), second.id.as_slice());
         assert_eq!(payload.rp.id, "example.com");
 
         // Another identity cannot read it, and the failure is a clean error.
         let other = dir.path().join("other-identities");
         age_keygen(&other);
-        let mut wrong = PassStorageAdapter::new_with_options(
-            store.clone(),
-            PathBuf::from("fido2"),
-            StoreCrypto::Age(crypto(&other)),
-            false,
-        )
-        .unwrap();
-        assert!(wrong.read(&credential.id).is_err());
+        let mut wrong = open(&store, "www", crypto(&other));
+        assert!(wrong.read(&second.id).is_err());
         let error = crypto(&other)
-            .decrypt(&fs::read(&file).unwrap())
+            .decrypt(&fs::read(site.join("passkey-a1b2c3d4.age")).unwrap())
             .unwrap_err()
             .to_string();
         assert!(error.contains("no identity matched"), "{error}");
+    }
+
+    /// An empty or `.` passkey root keeps the site folders directly in the store root.
+    #[test]
+    #[ignore = "requires the age and age-keygen binaries"]
+    fn site_folders_can_sit_at_the_store_root() {
+        for root in ["", "."] {
+            let dir = tempfile::tempdir().unwrap();
+            let identities = dir.path().join("identities");
+            age_keygen(&identities);
+            let credential = sample_credential();
+
+            open(dir.path(), root, crypto(&identities))
+                .write(credential_ref(&credential))
+                .unwrap();
+
+            assert!(
+                dir.path().join("example.com/passkey.age").is_file(),
+                "{root:?}"
+            );
+            let mut reopened = open(dir.path(), root, crypto(&identities));
+            assert_eq!(reopened.count_credentials(), 1);
+            assert_eq!(reopened.read(&credential.id).unwrap().rp.id, "example.com");
+        }
     }
 
     /// Without any `.age-recipients`, entries are encrypted to the identities file, as passage does.

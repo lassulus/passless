@@ -6,16 +6,17 @@
 pub mod age;
 pub mod gpg_id;
 pub mod init;
+pub mod layout;
 pub mod sync;
 
 use crate::storage::credential::Credential;
 use crate::storage::index::{
-    CredentialCache, CredentialIndexes, CredentialPathInfo, get_credential_path,
-    load_credential_paths, update_indexes_on_delete, update_indexes_on_write,
+    CredentialCache, CredentialPathInfo, load_credential_paths, update_indexes_on_delete,
+    update_indexes_on_write,
 };
 use crate::storage::rp_id::validate_rp_id_for_storage;
 use crate::storage::{CredentialFilter, CredentialStorage, RelyingPartyMetadata};
-use crate::util::{bytes_to_hex, create_secure_dir_all};
+use crate::util::bytes_to_hex;
 use passless_core::error::{Error, Result};
 
 use std::collections::HashMap;
@@ -40,7 +41,9 @@ pub struct PassStorageAdapter {
     store_path: PathBuf,
     path: PathBuf,
     crypto: StoreCrypto,
-    indexes: CredentialIndexes,
+    index: layout::StoreIndex,
+    /// RP of the current request: a passage passkey looked up by ID is only searched there.
+    rp_hint: Option<String>,
     cache: CredentialCache,
     iteration_index: usize,
     iteration_entries: Vec<PathBuf>,
@@ -143,6 +146,14 @@ impl StoreCrypto {
             Self::Age(_) => "age",
         }
     }
+
+    /// Whether `name` is an encrypted credential file of an RP folder (see [`layout`]).
+    pub fn is_credential_file_name(&self, name: &str) -> bool {
+        match self {
+            Self::Gpg(_) => name.ends_with(".gpg"),
+            Self::Age(_) => layout::is_passkey_file_name(name),
+        }
+    }
 }
 
 impl Display for StoreCrypto {
@@ -200,7 +211,8 @@ impl PassStorageAdapter {
             store_path,
             path,
             crypto,
-            indexes: Default::default(),
+            index: Default::default(),
+            rp_hint: None,
             cache: Default::default(),
             iteration_index: Default::default(),
             iteration_entries: Default::default(),
@@ -211,7 +223,7 @@ impl PassStorageAdapter {
         remove_stale_temp_files(&adapter.get_fido2_path(), extension);
 
         // Load indexes by scanning directory structure (no decryption!)
-        adapter.indexes = load_credential_paths(&adapter.get_fido2_path(), extension)
+        adapter.index = layout::StoreIndex::load(&adapter.get_fido2_path(), &adapter.crypto)
             .map_err(|e| Error::Storage(format!("Failed to load credential paths: {}", e)))?;
 
         Ok(adapter)
@@ -384,14 +396,47 @@ impl PassStorageAdapter {
         Ok(credential)
     }
 
-    /// Read a credential by its ID
-    fn read_credential_by_id(&mut self, id: &[u8]) -> Result<soft_fido2::Credential> {
-        let path_info = self.indexes.id.get(id).ok_or_else(|| {
+    /// Decrypt the not yet decrypted passage passkeys that `filter` needs, to learn their IDs.
+    /// A no-op for pass, whose file names are the IDs.
+    fn resolve_passkeys_for(&mut self, filter: &CredentialFilter) {
+        for rp in self.index.rps_to_resolve(filter, self.rp_hint.as_deref()) {
+            let (rp_id, files) = self.index.take_unresolved(&rp);
+            let Some(rp_id) = rp_id else { continue };
+            for file in files {
+                let file_name = file.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+                match (self.read_credential_from_path(&file), file_name) {
+                    (Ok(credential), Some(file_name)) => {
+                        let info = CredentialPathInfo::new(
+                            rp_id.clone(),
+                            credential.id,
+                            self.crypto.extension().to_string(),
+                        )
+                        .with_file_name(file_name);
+                        update_indexes_on_write(&mut self.index.known, info);
+                    }
+                    (result, _) => {
+                        if let Err(e) = result {
+                            warn!("Cannot read passkey {}: {}", file.display(), e);
+                        }
+                        self.index.keep_unresolved(&rp, file);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The index entry of credential `id`, decrypting passage passkeys of the request's RP if needed.
+    fn find_credential(&mut self, id: &[u8]) -> Result<CredentialPathInfo> {
+        self.resolve_passkeys_for(&CredentialFilter::ById(id.to_vec()));
+        self.index.known.id.get(id).cloned().ok_or_else(|| {
             debug!("Credential not found in index");
             Error::Storage("Credential not found".to_string())
-        })?;
+        })
+    }
 
-        let path = path_info.to_path(&self.get_fido2_path());
+    /// Read a credential by its ID
+    fn read_credential_by_id(&mut self, id: &[u8]) -> Result<soft_fido2::Credential> {
+        let path = self.find_credential(id)?.to_path(&self.get_fido2_path());
         self.read_credential_from_path(&path)
     }
 
@@ -413,12 +458,34 @@ impl PassStorageAdapter {
             .map_err(|e| Error::Storage(format!("Invalid RP ID: {}", e)))?;
 
         let extension = self.crypto.extension();
-        let path = get_credential_path(&self.get_fido2_path(), &rp_id, &cred.id, extension);
+        let fido2_path = self.get_fido2_path();
+        let path_info = match &self.crypto {
+            StoreCrypto::Gpg(_) => {
+                CredentialPathInfo::new(rp_id, cred.id.to_vec(), extension.to_string())
+            }
+            // An update (sign count, credProtect) rewrites the passkey's file. A new passkey gets
+            // a free name, so another account's file is never overwritten.
+            StoreCrypto::Age(_) => match self.find_in_rp(&rp_id, &cred.id) {
+                Some(existing) => existing,
+                None => {
+                    let file_name =
+                        layout::new_passkey_file_name(&fido2_path.join(rp_id.as_str()), &cred.id);
+                    if fido2_path.join(rp_id.as_str()).join(&file_name).exists() {
+                        return Err(Error::Storage(format!(
+                            "{file_name} of {rp_id} already holds another passkey"
+                        )));
+                    }
+                    CredentialPathInfo::new(rp_id, cred.id.to_vec(), extension.to_string())
+                        .with_file_name(file_name)
+                }
+            },
+        };
+        let path = path_info.to_path(&fido2_path);
         debug!("Writing credential to: {:?}", path);
 
         // Ensure parent directory exists with secure permissions
         if let Some(parent) = path.parent() {
-            create_secure_dir_all(parent).map_err(|e| {
+            layout::ensure_entry_dir(&self.crypto, parent).map_err(|e| {
                 debug!("Failed to create directory: {}", e);
                 Error::Storage(format!("Failed to create directory: {}", e))
             })?;
@@ -441,10 +508,15 @@ impl PassStorageAdapter {
         self.cache.remove(&path);
 
         // Update all indexes using shared function
-        let path_info = CredentialPathInfo::new(rp_id, cred.id.to_vec(), extension.to_string());
-        update_indexes_on_write(&mut self.indexes, path_info);
+        update_indexes_on_write(&mut self.index.known, path_info);
 
         Ok(())
+    }
+
+    /// The index entry of credential `id` among the passkeys of `rp_id`.
+    fn find_in_rp(&mut self, rp_id: &str, id: &[u8]) -> Option<CredentialPathInfo> {
+        self.resolve_passkeys_for(&CredentialFilter::ByRp(rp_id.to_string()));
+        self.index.known.id.get(id).cloned()
     }
 
     /// Delete a credential from the store
@@ -453,15 +525,7 @@ impl PassStorageAdapter {
 
         debug!("Deleting credential with ID: {}", bytes_to_hex(id));
 
-        let path_info = self
-            .indexes
-            .id
-            .get(id)
-            .ok_or_else(|| {
-                debug!("Credential not found in index");
-                Error::Storage("Credential not found".to_string())
-            })?
-            .clone();
+        let path_info = self.find_credential(id)?;
 
         // Convert to actual path
         let path = path_info.to_path(&self.get_fido2_path());
@@ -476,7 +540,7 @@ impl PassStorageAdapter {
         self.cache.remove(&path);
 
         // Remove from all indexes using shared function
-        update_indexes_on_delete(&mut self.indexes, id);
+        update_indexes_on_delete(&mut self.index.known, id);
 
         debug!("Successfully deleted credential");
 
@@ -969,7 +1033,11 @@ impl CredentialStorage for PassStorageAdapter {
 
         debug!("read_first called with filter: {:?}", filter);
 
-        self.iteration_entries = self.indexes.resolve_filter(&filter, &self.get_fido2_path());
+        self.resolve_passkeys_for(&filter);
+        self.iteration_entries = self
+            .index
+            .known
+            .resolve_filter(&filter, &self.get_fido2_path());
         self.iteration_index = 0;
 
         debug!(
@@ -1023,24 +1091,11 @@ impl CredentialStorage for PassStorageAdapter {
 
     fn list_relying_parties(&mut self) -> soft_fido2::Result<Vec<RelyingPartyMetadata>> {
         self.cache.evict_expired();
-        let mut result: Vec<_> = self
-            .indexes
-            .rp
-            .iter()
-            .map(|(id, credential_ids)| RelyingPartyMetadata {
-                id: id.clone(),
-                // RP display name is encrypted credential data. Do not decrypt secrets
-                // merely to provide an optional cosmetic field during discovery.
-                name: None,
-                credential_count: credential_ids.len(),
-            })
-            .collect();
-        result.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(result)
+        Ok(self.index.relying_parties())
     }
 
     fn count_credentials(&self) -> usize {
-        let count = self.indexes.id.len();
+        let count = self.index.count();
         debug!("count_credentials: {}", count);
         count
     }
@@ -1048,12 +1103,17 @@ impl CredentialStorage for PassStorageAdapter {
     /// From the path index: no GPG operation. (Every decrypting path takes `&mut self` for the
     /// cache and the decryption-key affinity; this one cannot reach them.)
     fn count_for_rp(&self, rp_id: &str) -> Option<usize> {
-        Some(self.indexes.count_for_rp(rp_id))
+        Some(self.index.count_for_rp(rp_id))
     }
 
-    /// From the path index: nothing is read, decrypted or unsealed.
+    /// From the path index: nothing is read, decrypted or unsealed. `None` while a passage
+    /// passkey's ID is still unknown.
     fn indexed_credentials(&self) -> Option<Vec<(String, Vec<u8>)>> {
-        Some(self.indexes.credentials())
+        self.index.credentials()
+    }
+
+    fn set_rp_hint(&mut self, rp_id: Option<&str>) {
+        self.rp_hint = rp_id.map(str::to_owned);
     }
 
     fn disable_user_verification(&self) -> bool {
@@ -1125,7 +1185,8 @@ mod tests {
             store_path: store_root.to_path_buf(),
             path: PathBuf::from("fido2"),
             crypto: StoreCrypto::Gpg(GpgBackend::GnupgBin),
-            indexes: CredentialIndexes::default(),
+            index: Default::default(),
+            rp_hint: None,
             cache: CredentialCache::new(),
             iteration_index: 0,
             iteration_entries: vec![],
@@ -1149,7 +1210,7 @@ mod tests {
         fs::write(second_rp.join("cc.gpg"), b"not gpg").unwrap();
 
         let mut adapter = create_adapter(root);
-        adapter.indexes = load_credential_paths(&fido2, "gpg").unwrap();
+        adapter.index = layout::StoreIndex::load(&fido2, &adapter.crypto).unwrap();
         let metadata = adapter.list_relying_parties().unwrap();
 
         assert_eq!(metadata.len(), 2);
@@ -1181,7 +1242,7 @@ mod tests {
         }
 
         let mut adapter = create_adapter(root);
-        adapter.indexes = load_credential_paths(&fido2, "gpg").unwrap();
+        adapter.index = layout::StoreIndex::load(&fido2, &adapter.crypto).unwrap();
         assert_eq!(adapter.count_for_rp("example.com"), Some(2));
         assert_eq!(adapter.count_for_rp("example.org"), Some(1));
         assert_eq!(adapter.count_for_rp("example.net"), Some(0));

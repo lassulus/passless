@@ -165,6 +165,11 @@ pub trait CredentialStorage: Send + Sync {
         None
     }
 
+    /// The RP ID of the CTAP request being served (`None` between requests). A backend that has to
+    /// decrypt to find a credential by ID (passage: the ID is not in the file name) only searches
+    /// this RP's credentials for [`Self::read`] and [`Self::delete`].
+    fn set_rp_hint(&mut self, _rp_id: Option<&str>) {}
+
     /// Check if user verification should be disabled for this backend
     ///
     /// Some backends (like pass) don't support user verification.
@@ -243,6 +248,10 @@ impl CredentialStorage for Box<dyn CredentialStorage> {
 
     fn disable_user_verification(&self) -> bool {
         (**self).disable_user_verification()
+    }
+
+    fn set_rp_hint(&mut self, rp_id: Option<&str>) {
+        (**self).set_rp_hint(rp_id)
     }
 
     fn begin_operation(&mut self) -> Result<()> {

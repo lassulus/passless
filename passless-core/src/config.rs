@@ -166,7 +166,8 @@ pub struct PassageBackendConfig {
     #[default(passage_store_path())]
     pub store_path: String,
 
-    /// Relative path within passage store for FIDO2 entries
+    /// Passkey root within the passage store: one folder per RP ID, shared with the site's other
+    /// entries (`<root>/<rp id>/passkey.age`). Empty or "." puts the folders at the store root.
     #[arg(
         long = "passage-path",
         env = "PASSLESS_PASSAGE_PATH",

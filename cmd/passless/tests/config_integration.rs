@@ -83,6 +83,22 @@ fn passage_section_resolves_to_the_passage_backend() {
     }
 }
 
+#[test]
+fn passage_passkey_root_may_be_the_store_root() {
+    let dir = tempdir().unwrap();
+    let backend = |path: &str| BackendConfig::Passage {
+        store_path: dir.path().display().to_string(),
+        path: path.to_string(),
+        identities_file: "identities".to_string(),
+        age_binary: "age".to_string(),
+    };
+    for path in ["", ".", "www", "fido2"] {
+        assert!(backend(path).validate().is_ok(), "{path:?}");
+    }
+    assert!(backend("../www").validate().is_err());
+    assert!(backend("/www").validate().is_err());
+}
+
 #[cfg(feature = "agent")]
 #[test]
 fn isolated_agent_has_independent_pass_git_configuration() {
