@@ -961,6 +961,10 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
                 CtapCommand::Selection,
             ])
             .max_credentials(100)
+            // Store every credential, also when rk=false is asked (WebAuthn lets the authenticator
+            // create a discoverable one then): never a key-wrapped credential ID, which would sign
+            // without reading the storage (for passage: without the decrypt approval).
+            .force_resident_keys(true)
             .extensions(vec!["credProtect".to_string()])
             .firmware_version(*VERSION)
             .constant_sign_count(security_config.constant_signature_counter)
@@ -1092,6 +1096,8 @@ impl<
                 CtapCommand::Selection,
             ])
             .max_credentials(100)
+            // See `build_authenticator`: every credential is stored.
+            .force_resident_keys(true)
             .extensions(vec!["credProtect".to_string()])
             .firmware_version(*VERSION)
             .constant_sign_count(security_config.constant_signature_counter)
@@ -5071,6 +5077,72 @@ mod protected_credential_tests {
                 "the real assertion uses the pre-flight's decrypt"
             );
         }
+    }
+
+    /// A registration asking for a non-resident credential (rk=false, as `ssh-keygen -t
+    /// ecdsa-sk` without `-O resident`) is stored in the passage store all the same, so signing
+    /// with it, also after a daemon restart, needs the store decrypt: there is no key-wrapped
+    /// credential ID that signs without one.
+    #[test]
+    fn a_non_resident_registration_on_passage_is_stored_and_needs_a_decrypt() {
+        use crate::storage::pass::age::{AgeCrypto, decrypt_count, install_counting_fake_age};
+        use crate::storage::pass::{PassStorageAdapter, StoreCrypto};
+
+        let dir = tempfile::tempdir().unwrap();
+        let identities = dir.path().join("identities");
+        std::fs::write(&identities, "fake").unwrap();
+        let log = dir.path().join("decrypts");
+        let fake_age = dir.path().join("age");
+        install_counting_fake_age(&fake_age, &log);
+        let _prompts = AutoAccept::install();
+        let service = || {
+            let storage = PassStorageAdapter::new_with_options(
+                dir.path().join("store"),
+                "www".into(),
+                StoreCrypto::Age(AgeCrypto::new(fake_age.clone(), identities.clone())),
+                false,
+            )
+            .unwrap();
+            AuthenticatorService::<_, (), _>::with_shared_storage(
+                Arc::new(Mutex::new(storage)),
+                None,
+                security_config(false),
+                PinConfig::default(),
+            )
+            .unwrap()
+        };
+        let handle = |service: &mut AuthenticatorService<PassStorageAdapter, ()>,
+                      request: &[u8]| {
+            let mut response = Vec::new();
+            service.handle(request, &mut response).unwrap();
+            decode_success(&response)
+        };
+
+        // No rk option at all: the platform asks for a non-resident credential.
+        let request = enroll_request(-7, None);
+        assert!(!String::from_utf8_lossy(&request).contains("rk"));
+        let attestation = handle(&mut service(), &request);
+        let auth_data = bytes_at(&attestation, int(2));
+        let id_len = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
+        let id = auth_data[55..55 + id_len].to_vec();
+        assert!(
+            dir.path()
+                .join("store/www")
+                .join(SSH_RP_ID)
+                .join("passkey.age")
+                .is_file(),
+            "stored in the site's folder"
+        );
+        assert_eq!(decrypt_count(&log), 0);
+
+        // A restarted daemon (fresh service, so a fresh credential-wrapping key) signs with it
+        // only by decrypting the stored passkey.
+        let assertion = handle(&mut service(), &sign_request(&[&id], true));
+        assert_eq!(
+            bytes_at(map_get(&assertion, &int(1)).unwrap(), text("id")),
+            id
+        );
+        assert_eq!(decrypt_count(&log), 1);
     }
 }
 
