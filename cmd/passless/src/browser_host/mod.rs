@@ -1,22 +1,27 @@
 //! The human authenticator as a browser's native messaging host.
 //!
 //! macOS has no UHID, so there passless cannot be a virtual USB key. Instead a browser extension
-//! intercepts WebAuthn (Chromium: `chrome.webAuthenticationProxy`) and sends every request over
-//! native messaging to this process, which the browser starts with the extension's origin as its
-//! only argument. A request is translated into the CTAP2 command a browser would send to a USB
-//! key (`webauthn.rs`) and served by the same `AuthenticatorService` as the UHID key: same
-//! storage backends, prompts, user verification settings and one decrypt per sign-in. Nothing
-//! runs between browser sessions: the browser starts the host and ends it by closing the port.
+//! takes over WebAuthn (Firefox: `cmd/passless/assets/firefox-extension/` replaces
+//! `navigator.credentials` in every page) and sends every request over native messaging to this
+//! process, which the browser starts and stops. A request is translated into the CTAP2 command a
+//! browser would send to a USB key (`webauthn.rs`) and served by the same `AuthenticatorService`
+//! as the UHID key: same storage backends, prompts, user verification settings and one decrypt
+//! per sign-in. Nothing runs between browser sessions.
+//!
+//! The host knows no browser specifics, so other browsers need only their own extension (for
+//! Chromium, one using `chrome.webAuthenticationProxy`).
 //!
 //! Wire protocol, both directions a 32-bit native-endian length followed by UTF-8 JSON:
 //! - extension to host: `{"type":"request","id":N,"op":"create"|"get","origin":"https://…",
-//!   "cross_origin":false,"body":"<requestDetailsJson>"}` and `{"type":"abort","id":N}`;
-//! - host to extension: `{"type":"result","id":N,"ok":true,"body":"<responseJson>"}` or
-//!   `{"type":"result","id":N,"ok":false,"error":{"dom":"NotAllowedError"}}`.
+//!   "cross_origin":false,"body":"<options as WebAuthn JSON>"}` and `{"type":"abort","id":N}`;
+//!   the body is `PublicKeyCredentialCreationOptionsJSON` / `…RequestOptionsJSON`;
+//! - host to extension: `{"type":"result","id":N,"ok":true,"body":"<PublicKeyCredential JSON>"}`
+//!   or `{"type":"result","id":N,"ok":false,"error":{"dom":"NotAllowedError"}}`.
 //!
-//! `origin` is the origin the browser vouches for (Chromium writes it into the request's
-//! `remoteDesktopClientOverride`; a page cannot set it). Only the extensions the host manifest
-//! lists in `allowed_origins` can start the host.
+//! `origin` must come from the browser, not the page (Firefox: the URL of the frame that sent
+//! the extension message). Everything else is the page's and is checked here: the host builds
+//! `clientDataJSON` and checks the RP ID against `origin`. Only the extensions the host manifest
+//! lists (`allowed_extensions` / `allowed_origins`) can start the host.
 
 mod webauthn;
 
@@ -47,7 +52,7 @@ use serde_json::{Value, json};
 
 /// Largest frame accepted from the browser.
 const MAX_REQUEST_BYTES: usize = 1 << 20;
-/// Chromium refuses messages from a host above 1 MiB.
+/// Browsers refuse messages from a host above 1 MiB.
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 /// How long a request waits for another passless process to release the store.
 const LOCK_WAIT: Duration = Duration::from_secs(30);
@@ -55,13 +60,20 @@ const LOCK_POLL: Duration = Duration::from_millis(100);
 /// How long the account choice stays up.
 const CHOICE_TIMEOUT_SECONDS: u32 = 60;
 
-/// Whether the browser started this process as its native messaging host: Chromium-family
-/// browsers pass the calling extension's origin (`chrome-extension://<id>/`) as the first
-/// argument.
-pub(crate) fn invoked_by_browser(mut args: impl Iterator<Item = OsString>) -> bool {
-    args.next()
-        .and_then(|arg| arg.into_string().ok())
-        .is_some_and(|arg| arg.starts_with("chrome-extension://"))
+/// Whether a browser started this process as its native messaging host. Firefox passes the
+/// path of the host manifest and the calling extension's ID; Chromium-family browsers the
+/// extension's origin (`chrome-extension://<id>/`, maybe followed by `--parent-window=…`).
+pub(crate) fn invoked_by_browser(args: impl Iterator<Item = OsString>) -> bool {
+    let args: Vec<String> = args.filter_map(|arg| arg.into_string().ok()).collect();
+    match args.as_slice() {
+        [origin, ..] if origin.starts_with("chrome-extension://") => true,
+        [manifest, extension_id] => {
+            manifest.ends_with(".json")
+                && !extension_id.is_empty()
+                && !extension_id.starts_with('-')
+        }
+        _ => false,
+    }
 }
 
 /// Serves the browser on stdin/stdout.

@@ -414,9 +414,9 @@ fn main() {
         process::exit(agent::escalation_prompt::child_main());
     }
 
-    // A browser starts its native messaging host with the calling extension's origin as the
-    // only argument (Chromium: `chrome-extension://<id>/`). The binary then serves that
-    // browser over stdin/stdout instead of creating a UHID device.
+    // A browser starts its native messaging host with its own arguments (Firefox: the host
+    // manifest path and the extension ID). The binary then serves that browser over
+    // stdin/stdout instead of creating a UHID device.
     let browser_host = browser_host::invoked_by_browser(std::env::args_os().skip(1));
 
     // Run main logic and format errors cleanly

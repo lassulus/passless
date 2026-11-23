@@ -386,13 +386,20 @@ fn aborted_and_malformed_requests() {
 }
 
 #[test]
-fn chromium_starts_the_host_with_the_extension_origin() {
+fn browsers_start_the_host_with_their_own_arguments() {
     let args = |list: &[&str]| {
         list.iter()
             .map(OsString::from)
             .collect::<Vec<_>>()
             .into_iter()
     };
+    // Firefox: host manifest path, extension ID.
+    assert!(invoked_by_browser(args(&[
+        "/Users/me/Library/Application Support/Mozilla/NativeMessagingHosts/rs.passless.browser.json",
+        "browser@passless.rs"
+    ])));
+    assert!(!invoked_by_browser(args(&["manifest.json", "--verbose"])));
+    // Chromium: extension origin, maybe a window handle.
     assert!(invoked_by_browser(args(&[
         "chrome-extension://abcdefghijklmnopabcdefghijklmnop/"
     ])));
