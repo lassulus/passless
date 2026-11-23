@@ -41,7 +41,6 @@ soft-fido2-transport.workspace = true
 soft-fido2-ctap.workspace = true
 log.workspace = true
 env_logger.workspace = true
-systemd-journal-logger.workspace = true
 sha2.workspace = true
 serde_cbor.workspace = true
 serde.workspace = true
@@ -49,12 +48,8 @@ prs-lib.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 nix.workspace = true
-notify-rust.workspace = true
-zbus.workspace = true
-futures-lite.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
-ctrlc.workspace = true
 signal-hook.workspace = true
 clap.workspace = true
 zeroize.workspace = true
@@ -65,6 +60,7 @@ ciborium = "0.2"
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 hmac = "0.13"
 url = "2"
+psl.workspace = true
 rpassword = "7.3"
 serde_bytes = "0.11.19"
 base64 = "0.23"
@@ -74,6 +70,19 @@ hkdf = { version = "0.13", optional = true }
 aes = { version = "0.9", optional = true }
 cipher = { version = "0.5", optional = true }
 toml.workspace = true
+
+# Linux only: `passless client` talks to hidraw devices through hidapi, the UHID key stops on
+# Ctrl-C, and logs go to journald under systemd.
+[target.'cfg(target_os = "linux")'.dependencies]
+soft-fido2 = { workspace = true, features = ["usb"] }
+systemd-journal-logger.workspace = true
+ctrlc.workspace = true
+
+# D-Bus notifications. macOS asks through dialogs instead (`notification/dialog.rs`).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify-rust.workspace = true
+zbus.workspace = true
+futures-lite.workspace = true
 
 [dev-dependencies]
 base64 = "0.23"

@@ -1586,6 +1586,7 @@ dependencies = [
  "passless-config-doc",
  "passless-core",
  "prs-lib",
+ "psl",
  "rand 0.8.8",
  "rpassword",
  "serde",

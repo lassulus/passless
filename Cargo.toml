@@ -19,7 +19,8 @@ repository = "https://github.com/pando85/passless"
 passless-core = { path = "./passless-core", version = "0.27.3" }
 passless-config-doc = { path = "./passless-config-doc", version = "0.27.3" }
 
-soft-fido2 = "0.19.0"
+# Without the USB (hidapi) transport: it needs IOKit on macOS. The Linux build adds it back.
+soft-fido2 = { version = "0.19.0", default-features = false, features = ["std"] }
 soft-fido2-ctap = "0.19.0"
 soft-fido2-crypto = "0.19.0"
 soft-fido2-transport = "0.19.0"

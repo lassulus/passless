@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_serde_derive::ClapSerde;
+#[cfg(target_os = "linux")]
 use libc::{PR_SET_DUMPABLE, prctl};
 use libc::{mlock, munlock};
 use log::debug;
@@ -519,9 +520,13 @@ impl SecurityConfig {
     fn disable_core_dumps_impl(&self) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Disabling core dumps to prevent credential leakage");
         setrlimit(Resource::RLIMIT_CORE, 0, 0)?;
-        let r = unsafe { prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) };
-        if r != 0 {
-            log::warn!("prctl(PR_SET_DUMPABLE) failed: {}", r);
+        // Linux only: also no ptrace attach or /proc/<pid>/mem by other processes of the user.
+        #[cfg(target_os = "linux")]
+        {
+            let r = unsafe { prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) };
+            if r != 0 {
+                log::warn!("prctl(PR_SET_DUMPABLE) failed: {}", r);
+            }
         }
         Ok(())
     }

@@ -1,0 +1,285 @@
+//! The prompts of the human path: user presence, user verification, consent and yes/no
+//! questions.
+//!
+//! The questions and `PASSLESS_INTERACTION_MODE` are shared; how they are shown depends on the
+//! platform: desktop notifications over D-Bus (`dbus`), or dialogs on macOS (`dialog`).
+
+#[cfg(not(target_os = "macos"))]
+mod dbus;
+// Compiled for tests everywhere, so its tests (with a fake osascript) run on Linux too.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod dialog;
+
+#[cfg(not(target_os = "macos"))]
+use dbus::{choose_one, show_prompt};
+#[cfg(not(target_os = "macos"))]
+pub use dbus::{show_error_notification, show_info_notification, show_yes_no_notification};
+#[cfg(target_os = "macos")]
+use dialog::{choose_one, show_prompt};
+#[cfg(target_os = "macos")]
+pub use dialog::{show_error_notification, show_info_notification, show_yes_no_notification};
+
+use log::warn;
+
+const INTERACTION_MODE_ENV: &str = "PASSLESS_INTERACTION_MODE";
+
+/// Result of user interaction via notification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationResult {
+    /// User approved the operation
+    Accepted,
+    /// User explicitly refused the operation (clicked Deny) or answered with an action the
+    /// prompt never offered
+    Denied,
+    /// The notification was closed without an answer: the user dismissed it, or it timed out.
+    /// The operation is still refused, but nobody refused it, so it must not be counted as a
+    /// failed verification attempt.
+    Dismissed,
+}
+
+/// Result of a yes/no question via notification
+///
+/// Closing the notification answers no: these questions have no retry budget to protect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YesNoResult {
+    Accepted,
+    Denied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    UserPresence,
+    UserVerification,
+    /// A dedicated consent prompt for lowering credential protection. Never auto-approved.
+    CredentialProtection,
+    /// Only the D-Bus notifications pick their actions by prompt kind.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    YesNo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionMode {
+    Desktop,
+    Automatic,
+}
+
+fn interaction_mode_from_value(value: Option<&str>) -> Result<InteractionMode, String> {
+    let Some(value) = value else {
+        return Ok(InteractionMode::Desktop);
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "desktop" => Ok(InteractionMode::Desktop),
+        "automatic" => Ok(InteractionMode::Automatic),
+        other => Err(format!(
+            "invalid {} value '{}'; expected 'desktop' or 'automatic'",
+            INTERACTION_MODE_ENV, other
+        )),
+    }
+}
+
+fn configured_interaction_mode() -> Result<InteractionMode, String> {
+    match std::env::var(INTERACTION_MODE_ENV) {
+        Ok(value) => interaction_mode_from_value(Some(&value)),
+        Err(std::env::VarError::NotPresent) => interaction_mode_from_value(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{} must contain valid UTF-8", INTERACTION_MODE_ENV))
+        }
+    }
+}
+
+/// Whether `PASSLESS_INTERACTION_MODE=automatic` makes the human path approve its prompts
+/// without user interaction. The agent subsystem refuses to start in that mode unless it is
+/// acknowledged (ADR 0014 section 7, R19). An invalid value is not automatic: the human path then
+/// fails every prompt instead of approving it.
+#[cfg(feature = "agent")]
+pub fn human_path_is_automatic() -> bool {
+    matches!(
+        configured_interaction_mode(),
+        Ok(InteractionMode::Automatic)
+    )
+}
+
+/// Whether `PASSLESS_INTERACTION_MODE=automatic` makes the human path approve its prompts
+/// without user interaction. `Err` for an unparsable value: callers must then refuse.
+pub fn interaction_mode_is_automatic() -> Result<bool, String> {
+    Ok(configured_interaction_mode()? == InteractionMode::Automatic)
+}
+
+fn show_confirmation_notification(
+    operation: &str,
+    relying_party: Option<&str>,
+    user: Option<&str>,
+    timeout_seconds: u32,
+    prompt_kind: PromptKind,
+) -> Result<NotificationResult, String> {
+    debug_assert!(!matches!(
+        prompt_kind,
+        PromptKind::YesNo | PromptKind::CredentialProtection
+    ));
+
+    if configured_interaction_mode()? == InteractionMode::Automatic {
+        warn!(
+            "{}=automatic: auto-approving {:?} without user interaction (rp={})",
+            INTERACTION_MODE_ENV,
+            prompt_kind,
+            relying_party.unwrap_or("<unknown>")
+        );
+        return Ok(NotificationResult::Accepted);
+    }
+
+    let mut message = format!("Operation: {}", operation);
+    if let Some(rp) = relying_party {
+        message.push_str(&format!("\nRelying Party: {}", rp));
+    }
+    if let Some(user) = user {
+        message.push_str(&format!("\nUser: {}", user));
+    }
+
+    let summary = match prompt_kind {
+        PromptKind::UserPresence => "👆 User Presence Required",
+        PromptKind::UserVerification => "🔒 User Verification Required",
+        PromptKind::CredentialProtection | PromptKind::YesNo => {
+            unreachable!("handled by their own functions")
+        }
+    };
+
+    show_prompt(summary, message, timeout_seconds, prompt_kind)
+}
+
+/// Ask the human to confirm lowering the protection of stored credentials.
+///
+/// `body` must be derived by the daemon from its own storage, never from the client request.
+/// This is a dedicated consent question: it is never auto-approved, not even with
+/// `PASSLESS_INTERACTION_MODE=automatic` (it is denied there), and closing the notification or
+/// letting it time out denies.
+pub fn show_credential_protection_notification(
+    summary: &str,
+    body: &str,
+    timeout_seconds: u32,
+) -> Result<NotificationResult, String> {
+    if configured_interaction_mode()? == InteractionMode::Automatic {
+        warn!(
+            "{}=automatic: denying {:?} instead of auto-approving it",
+            INTERACTION_MODE_ENV,
+            PromptKind::CredentialProtection
+        );
+        return Ok(NotificationResult::Denied);
+    }
+    show_prompt(
+        summary,
+        body.to_string(),
+        timeout_seconds,
+        PromptKind::CredentialProtection,
+    )
+}
+
+/// Show a CTAP user-presence notification and wait for response.
+///
+/// User presence is a consent gesture (for example, touching a hardware key),
+/// so notification activation may be used as the explicit gesture on daemons
+/// such as Dunst that do not expose action buttons directly.
+pub fn show_user_presence_notification(
+    operation: &str,
+    relying_party: Option<&str>,
+    user: Option<&str>,
+    timeout_seconds: u32,
+) -> Result<NotificationResult, String> {
+    show_confirmation_notification(
+        operation,
+        relying_party,
+        user,
+        timeout_seconds,
+        PromptKind::UserPresence,
+    )
+}
+
+/// Show a user-verification notification and wait for response.
+///
+/// Unlike user presence, Dunst activation is not treated as verification: the
+/// user must invoke the explicit Accept action through Dunst's action UI.
+pub fn show_verification_notification(
+    operation: &str,
+    relying_party: Option<&str>,
+    user: Option<&str>,
+    timeout_seconds: u32,
+) -> Result<NotificationResult, String> {
+    show_confirmation_notification(
+        operation,
+        relying_party,
+        user,
+        timeout_seconds,
+        PromptKind::UserVerification,
+    )
+}
+
+/// Ask which of `accounts` to sign in with at `relying_party` (several passkeys and no
+/// allowList). `None` when the user chose none or the question timed out.
+/// With `PASSLESS_INTERACTION_MODE=automatic` the first account is used.
+pub fn choose_account(
+    relying_party: &str,
+    accounts: &[String],
+    timeout_seconds: u32,
+) -> Result<Option<usize>, String> {
+    if configured_interaction_mode()? == InteractionMode::Automatic {
+        warn!(
+            "{}=automatic: signing in to {} with the first of {} accounts",
+            INTERACTION_MODE_ENV,
+            relying_party,
+            accounts.len()
+        );
+        return Ok((!accounts.is_empty()).then_some(0));
+    }
+    choose_one(
+        "🔑 Choose an account",
+        &format!("Sign in to {relying_party} as:"),
+        accounts,
+        timeout_seconds,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_notification_result_equality() {
+        assert_eq!(NotificationResult::Accepted, NotificationResult::Accepted);
+        assert_eq!(NotificationResult::Denied, NotificationResult::Denied);
+        assert_ne!(NotificationResult::Accepted, NotificationResult::Denied);
+        assert_ne!(NotificationResult::Denied, NotificationResult::Dismissed);
+    }
+
+    #[test]
+    fn test_interaction_mode_defaults_to_desktop() {
+        assert_eq!(
+            interaction_mode_from_value(None).unwrap(),
+            InteractionMode::Desktop
+        );
+        assert_eq!(
+            interaction_mode_from_value(Some("desktop")).unwrap(),
+            InteractionMode::Desktop
+        );
+    }
+
+    #[test]
+    fn test_interaction_mode_supports_explicit_automatic_mode() {
+        assert_eq!(
+            interaction_mode_from_value(Some("automatic")).unwrap(),
+            InteractionMode::Automatic
+        );
+        assert_eq!(
+            interaction_mode_from_value(Some(" Automatic ")).unwrap(),
+            InteractionMode::Automatic
+        );
+    }
+
+    #[test]
+    fn test_interaction_mode_rejects_unknown_values() {
+        let error = interaction_mode_from_value(Some("headless")).unwrap_err();
+        assert!(error.contains(INTERACTION_MODE_ENV));
+        assert!(error.contains("desktop"));
+        assert!(error.contains("automatic"));
+    }
+}

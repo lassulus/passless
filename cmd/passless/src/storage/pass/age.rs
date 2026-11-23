@@ -164,9 +164,19 @@ impl AgeCrypto {
         path: &Path,
         ciphertext: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>> {
+        let target = entry_name(store_root, path);
+        // The Secure Enclave's Touch ID sheet (age-plugin-se) cannot say what it unlocks, so a
+        // notification next to it names the entry.
+        #[cfg(target_os = "macos")]
+        {
+            let message = format!("Decrypting {target}");
+            std::thread::spawn(move || {
+                let _ = crate::notification::show_info_notification("Passless", &message);
+            });
+        }
         let mut command = Command::new(&self.binary);
         command
-            .env(TARGET_ENV, entry_name(store_root, path))
+            .env(TARGET_ENV, target)
             .arg("-d")
             .arg("-i")
             .arg(&self.identities_file);

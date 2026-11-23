@@ -1,7 +1,13 @@
+// Off Linux there is no UHID key, so its helpers (CTAPHID worker, Yubikey commands, instance
+// lock reporting) are unused there.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 #[cfg(feature = "agent")]
 pub mod agent;
 mod authenticator;
+mod browser_host;
 mod commands;
+mod cose;
 mod credential_backup;
 mod credential_protection;
 mod ctap_request;
@@ -12,6 +18,7 @@ mod notification;
 mod pin_storage;
 mod storage;
 mod util;
+#[cfg(target_os = "linux")]
 mod worker;
 
 use passless_core::{
@@ -20,15 +27,19 @@ use passless_core::{
 
 use soft_fido2::CredentialKeyProvider;
 use soft_fido2::SoftwareCredentialKeyProvider;
-use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, UhidDevice};
+use soft_fido2_transport::{Cmd, CommandHandler};
+#[cfg(target_os = "linux")]
+use soft_fido2_transport::{CtapHidHandler, UhidDevice};
 
 use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use authenticator::AuthenticatorService;
 use clap::Parser;
+#[cfg(target_os = "linux")]
 use commands::custom::register_yubikey_credential_mgmt;
 use log::{debug, error, info, warn};
 #[cfg(feature = "tpm")]
@@ -40,6 +51,7 @@ use storage::TpmStorageAdapter;
 use storage::pass::StoreCrypto;
 use storage::pass::age::AgeCrypto;
 use storage::{CredentialStorage, LocalStorageAdapter, PassStorageAdapter};
+#[cfg(target_os = "linux")]
 use worker::{UhidEndpoint, WorkerConfig, WorkerOutcome};
 
 shadow!(build);
@@ -191,7 +203,41 @@ impl<
     }
 }
 
+/// Where the human authenticator serves its CTAP requests.
+trait Frontend {
+    fn serve<
+        S: CredentialStorage + 'static,
+        P: PinStorage + 'static,
+        K: CredentialKeyProvider + Send + Sync + 'static,
+    >(
+        self,
+        service: AuthenticatorService<S, P, K>,
+    ) -> Result<()>;
+}
+
+/// The virtual FIDO2 key over UHID.
+#[cfg(target_os = "linux")]
+struct Uhid {
+    uhid: UhidDevice,
+    shutdown: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "linux")]
+impl Frontend for Uhid {
+    fn serve<
+        S: CredentialStorage + 'static,
+        P: PinStorage + 'static,
+        K: CredentialKeyProvider + Send + Sync + 'static,
+    >(
+        self,
+        service: AuthenticatorService<S, P, K>,
+    ) -> Result<()> {
+        run_with_service(service, self.uhid, self.shutdown)
+    }
+}
+
 /// Helper function to run the main loop with any storage backend
+#[cfg(target_os = "linux")]
 fn run_with_service<
     S: CredentialStorage + 'static,
     P: PinStorage + 'static,
@@ -204,7 +250,7 @@ fn run_with_service<
     run_with_service_inner(service, uhid, shutdown, None)
 }
 
-#[cfg(feature = "agent")]
+#[cfg(all(feature = "agent", target_os = "linux"))]
 fn run_with_service_and_lock<
     S: CredentialStorage + 'static,
     P: PinStorage + 'static,
@@ -284,6 +330,7 @@ fn join_agent_runtime(handle: Option<std::thread::JoinHandle<()>>) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn run_with_service_inner<
     S: CredentialStorage + 'static,
     P: PinStorage + 'static,
@@ -346,6 +393,7 @@ fn run_with_service_inner<
     }
 }
 
+#[cfg(target_os = "linux")]
 const UHID_ERROR_MESSAGE: &str = "Make sure you have the uhid kernel module loaded and proper permissions.\n\
 Run the following commands as root:\n\
   modprobe uhid\n\
@@ -366,16 +414,26 @@ fn main() {
         process::exit(agent::escalation_prompt::child_main());
     }
 
+    // A browser starts its native messaging host with the calling extension's origin as the
+    // only argument (Chromium: `chrome-extension://<id>/`). The binary then serves that
+    // browser over stdin/stdout instead of creating a UHID device.
+    let browser_host = browser_host::invoked_by_browser(std::env::args_os().skip(1));
+
     // Run main logic and format errors cleanly
-    if let Err(e) = run() {
+    if let Err(e) = run(browser_host) {
         eprintln!("Error: {}", e.format_cli());
         process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
-    // Parse CLI arguments
-    let cli_args = CliArgs::parse();
+fn run(browser_host: bool) -> Result<()> {
+    // Parse CLI arguments. As a browser's native messaging host the arguments are the browser's;
+    // the configuration then comes from the config file and PASSLESS_* variables only.
+    let cli_args = if browser_host {
+        CliArgs::parse_from(["passless"])
+    } else {
+        CliArgs::parse()
+    };
     let mut args = cli_args.args;
 
     // `doctor` loads the configuration itself (it needs no daemon).
@@ -563,7 +621,7 @@ fn run() -> Result<()> {
     };
 
     #[cfg(feature = "agent")]
-    let agent_enabled = config.agents.enabled;
+    let agent_enabled = config.agents.enabled && !browser_host;
     #[cfg(not(feature = "agent"))]
     let agent_enabled = false;
 
@@ -820,70 +878,173 @@ fn run() -> Result<()> {
         {
             unreachable!()
         }
+    } else if browser_host {
+        info!("Serving a browser over native messaging");
+        serve_human(
+            &config,
+            backend.clone(),
+            pass_git_sync,
+            pass_git_auto_push,
+            credential_cache_ttl,
+            browser_host::BrowserHost::new(backend),
+        )
     } else {
-        info!("Acquiring instance lock...");
-        let _instance_lock = instance_lock::InstanceLock::acquire(&backend)?;
-        debug!(
-            "Instance lock acquired at {}",
-            _instance_lock.lock_path().display()
-        );
+        #[cfg(target_os = "linux")]
+        {
+            info!("Acquiring instance lock...");
+            let _instance_lock = instance_lock::InstanceLock::acquire(&backend)?;
+            debug!(
+                "Instance lock acquired at {}",
+                _instance_lock.lock_path().display()
+            );
 
-        info!("Creating UHID device...");
+            info!("Creating UHID device...");
 
-        #[cfg(debug_assertions)]
-        let (vendor_id, product_id) = {
-            let vendor_id = std::env::var("PASSLESS_TEST_VENDOR_ID").ok().and_then(|s| {
-                let s = s.strip_prefix("0x").unwrap_or(&s);
-                u16::from_str_radix(s, 16).ok()
-            });
-            let product_id = std::env::var("PASSLESS_TEST_PRODUCT_ID")
-                .ok()
-                .and_then(|s| {
+            #[cfg(debug_assertions)]
+            let (vendor_id, product_id) = {
+                let vendor_id = std::env::var("PASSLESS_TEST_VENDOR_ID").ok().and_then(|s| {
                     let s = s.strip_prefix("0x").unwrap_or(&s);
                     u16::from_str_radix(s, 16).ok()
                 });
-            (vendor_id, product_id)
-        };
+                let product_id = std::env::var("PASSLESS_TEST_PRODUCT_ID")
+                    .ok()
+                    .and_then(|s| {
+                        let s = s.strip_prefix("0x").unwrap_or(&s);
+                        u16::from_str_radix(s, 16).ok()
+                    });
+                (vendor_id, product_id)
+            };
 
-        #[cfg(not(debug_assertions))]
-        let (vendor_id, product_id) = (Some(0x15d9), Some(0x0a37));
+            #[cfg(not(debug_assertions))]
+            let (vendor_id, product_id) = (Some(0x15d9), Some(0x0a37));
 
-        let uhid = UhidDevice::create_fido_device_with_ids(None, vendor_id, product_id, None)
-            .map_err(|e| Error::Uhid(format!("{:?}", e)))
-            .inspect_err(|_e| {
-                error!("Failed to create UHID device");
-                error!("\n{}", UHID_ERROR_MESSAGE);
-            })?;
+            let uhid = UhidDevice::create_fido_device_with_ids(None, vendor_id, product_id, None)
+                .map_err(|e| Error::Uhid(format!("{:?}", e)))
+                .inspect_err(|_e| {
+                    error!("Failed to create UHID device");
+                    error!("\n{}", UHID_ERROR_MESSAGE);
+                })?;
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
-        let ctrlc_pressed = Arc::new(AtomicBool::new(false));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_clone = shutdown.clone();
+            let ctrlc_pressed = Arc::new(AtomicBool::new(false));
 
-        ctrlc::set_handler(move || {
-            if ctrlc_pressed.load(Ordering::Relaxed) {
-                error!("Second interrupt signal received, forcing immediate exit");
-                process::exit(1);
+            ctrlc::set_handler(move || {
+                if ctrlc_pressed.load(Ordering::Relaxed) {
+                    error!("Second interrupt signal received, forcing immediate exit");
+                    process::exit(1);
+                }
+                info!("Received interrupt signal (Ctrl+C)");
+                info!("Initiating graceful shutdown... (press Ctrl+C again to force exit)");
+                shutdown_clone.store(true, Ordering::Relaxed);
+                ctrlc_pressed.store(true, Ordering::Relaxed);
+            })
+            .map_err(|e| Error::Other(format!("Failed to set Ctrl-C handler: {}", e)))?;
+
+            serve_human(
+                &config,
+                backend,
+                pass_git_sync,
+                pass_git_auto_push,
+                credential_cache_ttl,
+                Uhid { uhid, shutdown },
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(Error::Other(
+                "the virtual FIDO2 key needs Linux UHID; on this system passless runs only as a \
+                 browser's native messaging host"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+/// Build the human authenticator for `backend` and serve it through `frontend`.
+fn serve_human(
+    config: &AppConfig,
+    backend: BackendConfig,
+    pass_git_sync: bool,
+    pass_git_auto_push: bool,
+    credential_cache_ttl: Option<std::time::Duration>,
+    frontend: impl Frontend,
+) -> Result<()> {
+    info!("Creating authenticator service...");
+
+    let security_config = config.security_config();
+    let pin_config = config.pin_config();
+    let allow_storage_creation = allow_e2e_storage_creation();
+
+    match backend {
+        BackendConfig::Local { path } => {
+            let storage =
+                LocalStorageAdapter::new_with_options(path.clone().into(), allow_storage_creation)?;
+            let pin_storage = LocalPinStorage::new(path.into());
+            let pin_storage = Arc::new(Mutex::new(pin_storage));
+            let service = AuthenticatorService::with_pin_storage(
+                storage,
+                Some(pin_storage),
+                security_config,
+                pin_config,
+            )?;
+            frontend.serve(service)
+        }
+        BackendConfig::Pass { .. } | BackendConfig::Passage { .. } => {
+            let (store_path, path, crypto) = pass_store(&backend)?;
+            let mut storage = PassStorageAdapter::new_with_options_and_git_sync(
+                store_path.clone().into(),
+                path.clone().into(),
+                crypto.clone(),
+                allow_storage_creation,
+                pass_git_sync,
+                pass_git_auto_push,
+            )?;
+            if let Some(ttl) = credential_cache_ttl {
+                storage.set_cache_ttl(ttl);
             }
-            info!("Received interrupt signal (Ctrl+C)");
-            info!("Initiating graceful shutdown... (press Ctrl+C again to force exit)");
-            shutdown_clone.store(true, Ordering::Relaxed);
-            ctrlc_pressed.store(true, Ordering::Relaxed);
-        })
-        .map_err(|e| Error::Other(format!("Failed to set Ctrl-C handler: {}", e)))?;
+            let pass_sync = storage.sync_handle();
+            let pin_storage =
+                PassPinStorage::new_with_sync(store_path.into(), path.into(), crypto, pass_sync);
+            let pin_storage = Arc::new(Mutex::new(pin_storage));
+            let service = AuthenticatorService::with_pin_storage(
+                storage,
+                Some(pin_storage),
+                security_config,
+                pin_config,
+            )?;
+            frontend.serve(service)
+        }
+        #[cfg(feature = "tpm")]
+        BackendConfig::Tpm {
+            path,
+            tcti,
+            portable,
+        } => {
+            if portable {
+                use storage::tpm::portable::build_portable_bundle;
 
-        info!("Creating authenticator service...");
-
-        let security_config = config.security_config();
-        let pin_config = config.pin_config();
-        let allow_storage_creation = allow_e2e_storage_creation();
-
-        match backend {
-            BackendConfig::Local { path } => {
-                let storage = LocalStorageAdapter::new_with_options(
+                let (provider, storage, pin_storage) = build_portable_bundle(
                     path.clone().into(),
+                    Some(tcti.clone()),
                     allow_storage_creation,
                 )?;
-                let pin_storage = LocalPinStorage::new(path.into());
+                let pin_storage = Arc::new(Mutex::new(pin_storage));
+                let service = AuthenticatorService::with_pin_storage_and_key_provider(
+                    storage,
+                    Some(pin_storage),
+                    provider,
+                    security_config,
+                    pin_config,
+                )?;
+                frontend.serve(service)
+            } else {
+                let storage = TpmStorageAdapter::new_with_options(
+                    path.clone().into(),
+                    Some(tcti.clone()),
+                    allow_storage_creation,
+                )?;
+                let pin_storage = TpmPinStorage::new(path.into(), Some(tcti));
                 let pin_storage = Arc::new(Mutex::new(pin_storage));
                 let service = AuthenticatorService::with_pin_storage(
                     storage,
@@ -891,76 +1052,7 @@ fn run() -> Result<()> {
                     security_config,
                     pin_config,
                 )?;
-                run_with_service(service, uhid, shutdown)
-            }
-            BackendConfig::Pass { .. } | BackendConfig::Passage { .. } => {
-                let (store_path, path, crypto) = pass_store(&backend)?;
-                let mut storage = PassStorageAdapter::new_with_options_and_git_sync(
-                    store_path.clone().into(),
-                    path.clone().into(),
-                    crypto.clone(),
-                    allow_storage_creation,
-                    pass_git_sync,
-                    pass_git_auto_push,
-                )?;
-                if let Some(ttl) = credential_cache_ttl {
-                    storage.set_cache_ttl(ttl);
-                }
-                let pass_sync = storage.sync_handle();
-                let pin_storage = PassPinStorage::new_with_sync(
-                    store_path.into(),
-                    path.into(),
-                    crypto,
-                    pass_sync,
-                );
-                let pin_storage = Arc::new(Mutex::new(pin_storage));
-                let service = AuthenticatorService::with_pin_storage(
-                    storage,
-                    Some(pin_storage),
-                    security_config,
-                    pin_config,
-                )?;
-                run_with_service(service, uhid, shutdown)
-            }
-            #[cfg(feature = "tpm")]
-            BackendConfig::Tpm {
-                path,
-                tcti,
-                portable,
-            } => {
-                if portable {
-                    use storage::tpm::portable::build_portable_bundle;
-
-                    let (provider, storage, pin_storage) = build_portable_bundle(
-                        path.clone().into(),
-                        Some(tcti.clone()),
-                        allow_storage_creation,
-                    )?;
-                    let pin_storage = Arc::new(Mutex::new(pin_storage));
-                    let service = AuthenticatorService::with_pin_storage_and_key_provider(
-                        storage,
-                        Some(pin_storage),
-                        provider,
-                        security_config,
-                        pin_config,
-                    )?;
-                    run_with_service(service, uhid, shutdown)
-                } else {
-                    let storage = TpmStorageAdapter::new_with_options(
-                        path.clone().into(),
-                        Some(tcti.clone()),
-                        allow_storage_creation,
-                    )?;
-                    let pin_storage = TpmPinStorage::new(path.into(), Some(tcti));
-                    let pin_storage = Arc::new(Mutex::new(pin_storage));
-                    let service = AuthenticatorService::with_pin_storage(
-                        storage,
-                        Some(pin_storage),
-                        security_config,
-                        pin_config,
-                    )?;
-                    run_with_service(service, uhid, shutdown)
-                }
+                frontend.serve(service)
             }
         }
     }

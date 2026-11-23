@@ -306,6 +306,15 @@ when PIN settings change and decrypted again only when the file changes. Each `a
 entry it reads or writes in `PASSLESS_AGE_TARGET` (e.g. `www/github.com/passkey`), so an `age`
 wrapper's PIN prompt can name it; the data itself still goes through stdin.
 
+### macOS and other systems without UHID (browser extension)
+
+Where no virtual USB key can be created (macOS), passless serves Chromium-family browsers
+(Chrome, Chromium, Brave, Edge, Vivaldi) directly: the extension in
+`cmd/passless/assets/browser-extension/` takes over the browser's WebAuthn requests
+(`chrome.webAuthenticationProxy`) and hands them to `passless`, which the browser starts as its
+native messaging host `rs.passless.browser`. Same configuration, storage and prompts as the UHID
+key; on macOS prompts are dialogs. Setup: [docs/MACOS.md](docs/MACOS.md).
+
 ### Headless automatic interaction
 
 By default, Passless uses the desktop notification service when a WebAuthn operation needs local

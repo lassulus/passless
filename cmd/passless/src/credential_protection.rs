@@ -817,10 +817,11 @@ mod tests {
 
         let allowed = [
             "authenticator.rs",
+            "browser_host/tests.rs",
             "commands/client.rs",
             "human_prompts.rs",
             "main.rs",
-            "notification.rs",
+            "notification/mod.rs",
         ];
         let needles = [
             "credential_protection",

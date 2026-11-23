@@ -1,17 +1,24 @@
 use env_logger::Builder;
-use log::{LevelFilter, Log, Metadata, Record};
+use log::LevelFilter;
+#[cfg(target_os = "linux")]
+use log::{Log, Metadata, Record};
+#[cfg(target_os = "linux")]
 use systemd_journal_logger::JournalLog;
 
 const LOG_LEVEL_ENV: &str = "PASSLESS_LOG_LEVEL";
 const LOG_STYLE_ENV: &str = "PASSLESS_LOG_STYLE";
+#[cfg(target_os = "linux")]
 const SYSLOG_IDENTIFIER_ENV: &str = "PASSLESS_SYSLOG_IDENTIFIER";
+#[cfg(target_os = "linux")]
 const DEFAULT_SYSLOG_IDENTIFIER: &str = "passless";
 
+#[cfg(target_os = "linux")]
 struct FilteredJournalLog {
     filter: env_logger::Logger,
     journal: JournalLog,
 }
 
+#[cfg(target_os = "linux")]
 impl Log for FilteredJournalLog {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         Log::enabled(&self.filter, metadata)
@@ -50,26 +57,37 @@ fn log_builder() -> Builder {
     configured_builder(filter.as_deref(), style.as_deref())
 }
 
-pub fn init(max_level: LevelFilter) {
-    if systemd_journal_logger::connected_to_journal() {
-        match JournalLog::new() {
-            Ok(journal) => {
-                let identifier = std::env::var(SYSLOG_IDENTIFIER_ENV)
-                    .unwrap_or_else(|_| DEFAULT_SYSLOG_IDENTIFIER.to_string());
-                let filter = log_builder().build();
-                let journal = journal.with_syslog_identifier(identifier);
+/// Log to journald when it is connected (a systemd unit). `false` when not, or when that fails.
+#[cfg(target_os = "linux")]
+fn init_journal(max_level: LevelFilter) -> bool {
+    if !systemd_journal_logger::connected_to_journal() {
+        return false;
+    }
+    match JournalLog::new() {
+        Ok(journal) => {
+            let identifier = std::env::var(SYSLOG_IDENTIFIER_ENV)
+                .unwrap_or_else(|_| DEFAULT_SYSLOG_IDENTIFIER.to_string());
+            let filter = log_builder().build();
+            let journal = journal.with_syslog_identifier(identifier);
 
-                log::set_boxed_logger(Box::new(FilteredJournalLog { filter, journal }))
-                    .expect("Logger was already installed.");
-                log::set_max_level(max_level);
-                return;
-            }
-            Err(error) => {
-                eprintln!(
-                    "Failed to initialize native journald logging ({error}); falling back to stderr"
-                );
-            }
+            log::set_boxed_logger(Box::new(FilteredJournalLog { filter, journal }))
+                .expect("Logger was already installed.");
+            log::set_max_level(max_level);
+            true
         }
+        Err(error) => {
+            eprintln!(
+                "Failed to initialize native journald logging ({error}); falling back to stderr"
+            );
+            false
+        }
+    }
+}
+
+pub fn init(max_level: LevelFilter) {
+    #[cfg(target_os = "linux")]
+    if init_journal(max_level) {
+        return;
     }
 
     let mut builder = log_builder();

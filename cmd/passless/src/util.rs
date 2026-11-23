@@ -45,7 +45,8 @@ pub fn create_secure_file<P: AsRef<Path>>(path: P) -> io::Result<File> {
     let c_path = path_to_cstring(path)?;
 
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_TRUNC;
-    let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o600u32 as libc::mode_t) };
+    // The variadic mode is promoted to an unsigned int (mode_t is 16 bits on macOS).
+    let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o600 as libc::c_uint) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -129,7 +130,7 @@ pub fn atomic_write_in_dir<P: AsRef<Path>>(dir: P, filename: &str, data: &[u8]) 
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid filename"))?;
 
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let tmp_fd = unsafe { libc::openat(dir_fd, c_tmp.as_ptr(), flags, 0o600u32 as libc::mode_t) };
+    let tmp_fd = unsafe { libc::openat(dir_fd, c_tmp.as_ptr(), flags, 0o600 as libc::c_uint) };
     if tmp_fd < 0 {
         let err = io::Error::last_os_error();
         unsafe { libc::close(dir_fd) };
