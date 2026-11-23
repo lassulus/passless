@@ -170,6 +170,10 @@ pub trait CredentialStorage: Send + Sync {
     /// this RP's credentials for [`Self::read`] and [`Self::delete`].
     fn set_rp_hint(&mut self, _rp_id: Option<&str>) {}
 
+    /// Drop every decrypted credential kept in memory: the sign-in it was decrypted for is over.
+    /// Backends without a cache keep the default no-op.
+    fn forget_decrypted_credentials(&mut self) {}
+
     /// Check if user verification should be disabled for this backend
     ///
     /// Some backends (like pass) don't support user verification.
@@ -252,6 +256,10 @@ impl CredentialStorage for Box<dyn CredentialStorage> {
 
     fn set_rp_hint(&mut self, rp_id: Option<&str>) {
         (**self).set_rp_hint(rp_id)
+    }
+
+    fn forget_decrypted_credentials(&mut self) {
+        (**self).forget_decrypted_credentials()
     }
 
     fn begin_operation(&mut self) -> Result<()> {

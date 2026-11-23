@@ -38,8 +38,9 @@ pub struct PassStorageAdapter {
     allow_create_without_prompt: bool,
     indexed_generation: RepositoryGeneration,
     sync: PassGitSync,
-    /// Kept here too, so a reloaded inner adapter gets it back.
+    /// Kept here too, so a reloaded inner adapter gets them back.
     rp_hint: Option<String>,
+    cache_ttl: Option<std::time::Duration>,
 }
 
 impl PassStorageAdapter {
@@ -86,6 +87,7 @@ impl PassStorageAdapter {
             indexed_generation,
             sync,
             rp_hint: None,
+            cache_ttl: None,
         };
 
         // Never let a Git-sync `git add .` stage a temporary file a crash left behind.
@@ -102,6 +104,12 @@ impl PassStorageAdapter {
 
     pub fn sync_handle(&self) -> PassGitSync {
         self.sync.clone()
+    }
+
+    /// See [`InnerPassStorageAdapter::set_cache_ttl`].
+    pub fn set_cache_ttl(&mut self, ttl: std::time::Duration) {
+        self.cache_ttl = Some(ttl);
+        self.inner.set_cache_ttl(ttl);
     }
 
     fn repository_generation(&self) -> RepositoryGeneration {
@@ -126,6 +134,9 @@ impl PassStorageAdapter {
         )?;
         self.inner = inner;
         self.inner.set_rp_hint(self.rp_hint.as_deref());
+        if let Some(ttl) = self.cache_ttl {
+            self.inner.set_cache_ttl(ttl);
+        }
         // The constructor may pull newer remote state, so sample again after it returns.
         self.indexed_generation = self.repository_generation();
         Ok(())
@@ -294,6 +305,10 @@ impl CredentialStorage for PassStorageAdapter {
     fn set_rp_hint(&mut self, rp_id: Option<&str>) {
         self.rp_hint = rp_id.map(str::to_owned);
         self.inner.set_rp_hint(rp_id);
+    }
+
+    fn forget_decrypted_credentials(&mut self) {
+        self.inner.forget_decrypted_credentials();
     }
 
     fn disable_user_verification(&self) -> bool {

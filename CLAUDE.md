@@ -257,6 +257,8 @@ Configuration can be set via environment variables:
 - `PASSLESS_PASS_GPG_BACKEND`: "gpgme" or "gnupg-bin"
 - `PASSLESS_PASSAGE_STORE_PATH`, `PASSLESS_PASSAGE_PATH`, `PASSLESS_PASSAGE_IDENTITIES_FILE`,
   `PASSLESS_PASSAGE_AGE_BINARY`: passage backend (defaults follow passage's `PASSAGE_*` variables)
+- `PASSLESS_PASSAGE_CACHE_TTL`: longest time in seconds a decrypted passkey stays in memory
+  (default: 15; it is dropped earlier, when the sign-in ends)
 - `PASSLESS_TPM_PATH`: TPM storage directory
 - `PASSLESS_TPM_TCTI`: TPM TCTI configuration (e.g., "device:/dev/tpmrm0", "swtpm:path=/path/to/socket")
 - `PASSLESS_USE_MLOCK`: Enable memory locking (default: true)

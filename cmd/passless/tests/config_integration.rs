@@ -52,7 +52,8 @@ fn passage_section_resolves_to_the_passage_backend() {
          [passage]\n\
          store_path = \"/srv/passage\"\n\
          identities_file = \"/srv/identities\"\n\
-         git_auto_push = false\n",
+         git_auto_push = false\n\
+         cache_ttl = 5\n",
     );
     let mut args = Args::try_parse_from([
         "passless",
@@ -65,6 +66,12 @@ fn passage_section_resolves_to_the_passage_backend() {
     let config = AppConfig::load(&mut args).unwrap();
 
     assert!(config.passage.git_sync);
+    assert_eq!(
+        AppConfig::from(&mut Args::parse_from(["passless"]).config)
+            .passage
+            .cache_ttl,
+        15
+    );
     assert!(!config.passage.git_auto_push);
     assert!(config.pass.git_auto_push, "[pass] is independent");
     match config.backend().unwrap() {
@@ -73,11 +80,13 @@ fn passage_section_resolves_to_the_passage_backend() {
             path,
             identities_file,
             age_binary,
+            cache_ttl,
         } => {
             assert_eq!(store_path, "/srv/passage");
             assert_eq!(path, "fido2");
             assert_eq!(identities_file, "/srv/identities");
             assert_eq!(age_binary, "/opt/age/bin/age");
+            assert_eq!(cache_ttl, 5);
         }
         other => panic!("expected the passage backend, got {other:?}"),
     }
@@ -91,6 +100,7 @@ fn passage_passkey_root_may_be_the_store_root() {
         path: path.to_string(),
         identities_file: "identities".to_string(),
         age_binary: "age".to_string(),
+        cache_ttl: 15,
     };
     for path in ["", ".", "www", "fido2"] {
         assert!(backend(path).validate().is_ok(), "{path:?}");

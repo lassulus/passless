@@ -80,33 +80,80 @@ fn backup_state_for_export(
 
 const CTAP_MAKE_CREDENTIAL: u8 = 0x01;
 const CTAP_GET_ASSERTION: u8 = 0x02;
+const CTAP_GET_INFO: u8 = 0x04;
+const CTAP_CLIENT_PIN: u8 = 0x06;
+const CTAP_SELECTION: u8 = 0x0B;
 const CRED_PROTECT_UV_REQUIRED: u8 = 0x03;
 
-/// The RP ID of a MakeCredential (`rp.id`, key 2) or GetAssertion (`rpId`, key 1) request.
-fn request_rp_id(request: &[u8]) -> Option<String> {
-    use ciborium::Value;
+/// What storage needs to know about a CTAP request around serving it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RequestScope {
+    /// RP ID of a MakeCredential (`rp.id`, key 2) or GetAssertion (`rpId`, key 1).
+    rp_id: Option<String>,
+    /// A GetAssertion with `up: false`: a platform's "pre-flight" that checks which allowList
+    /// (or excludeList) credentials the authenticator holds, ahead of the real request.
+    silent_assertion: bool,
+}
 
-    let (&command, params) = request.split_first()?;
-    let key = match command {
-        CTAP_MAKE_CREDENTIAL => 2,
-        CTAP_GET_ASSERTION => 1,
-        _ => return None,
-    };
-    let Value::Map(params) = ciborium::from_reader(params).ok()? else {
-        return None;
-    };
-    let (_, value) = params
-        .into_iter()
-        .find(|(k, _)| k.as_integer() == Some(key.into()))?;
-    match value {
-        Value::Text(rp_id) => Some(rp_id),
-        Value::Map(rp) => rp
-            .into_iter()
-            .find(|(k, _)| k.as_text() == Some("id"))?
-            .1
-            .into_text()
-            .ok(),
-        _ => None,
+impl RequestScope {
+    fn parse(request: &[u8]) -> Self {
+        use ciborium::Value;
+
+        let Some((&command, params)) = request.split_first() else {
+            return Self::default();
+        };
+        let rp_key = match command {
+            CTAP_MAKE_CREDENTIAL => 2,
+            CTAP_GET_ASSERTION => 1,
+            _ => return Self::default(),
+        };
+        let Ok(Value::Map(params)) = ciborium::from_reader::<Value, _>(params) else {
+            return Self::default();
+        };
+        let field = |key: u8| {
+            params
+                .iter()
+                .find(|(k, _)| k.as_integer() == Some(key.into()))
+                .map(|(_, v)| v)
+        };
+        let rp_id = match field(rp_key) {
+            Some(Value::Text(rp_id)) => Some(rp_id.clone()),
+            Some(Value::Map(rp)) => rp
+                .iter()
+                .find(|(k, _)| k.as_text() == Some("id"))
+                .and_then(|(_, v)| v.as_text())
+                .map(str::to_owned),
+            _ => None,
+        };
+        let silent_assertion = command == CTAP_GET_ASSERTION
+            && field(5).and_then(Value::as_map).is_some_and(|options| {
+                options
+                    .iter()
+                    .any(|(k, v)| k.as_text() == Some("up") && v.as_bool() == Some(false))
+            });
+        Self {
+            rp_id,
+            silent_assertion,
+        }
+    }
+
+    /// Whether credentials decrypted while serving the request may stay in memory afterwards.
+    ///
+    /// One sign-in needs the passkey twice: the platform's silent pre-flight (an `up: false`
+    /// GetAssertion, Firefox's `do_credential_list_filtering_ctap2`, sent once per allowList chunk
+    /// and answered NO_CREDENTIALS for chunks without ours) and then the real GetAssertion or
+    /// MakeCredential. Only what may come between those keeps the cache: pre-flights, GetInfo,
+    /// ClientPIN and Selection. Everything else ends the sign-in (the real assertion, a
+    /// registration, a cancel) and drops it.
+    fn keeps_decrypted_credentials(&self, command: Option<u8>) -> bool {
+        if crate::ctap_request::cancelled() {
+            return false;
+        }
+        match command {
+            Some(CTAP_GET_ASSERTION) => self.silent_assertion,
+            Some(CTAP_GET_INFO | CTAP_CLIENT_PIN | CTAP_SELECTION) => true,
+            _ => false,
+        }
     }
 }
 
@@ -1663,10 +1710,16 @@ impl<
 
     /// Process a CTAP request and generate a response
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
-        let rp_id = request_rp_id(request);
-        lock_shared_storage(&self.storage).set_rp_hint(rp_id.as_deref());
+        let scope = RequestScope::parse(request);
+        lock_shared_storage(&self.storage).set_rp_hint(scope.rp_id.as_deref());
         let result = self.handle_request(request, response_buffer);
-        lock_shared_storage(&self.storage).set_rp_hint(None);
+        {
+            let mut storage = lock_shared_storage(&self.storage);
+            storage.set_rp_hint(None);
+            if result.is_err() || !scope.keeps_decrypted_credentials(request.first().copied()) {
+                storage.forget_decrypted_credentials();
+            }
+        }
         // soft-fido2 reports a CTAP error as a one-byte status response, not as an `Err`, so
         // inspect what is actually answered, whichever handler answered it.
         if result.is_ok() && is_uv_blocked_response(response_buffer) {
@@ -4850,11 +4903,73 @@ mod protected_credential_tests {
         non_canonical.splice(1..2, [0x18, 0x01]);
         assert!(GetAssertionUvView::without_uv(&non_canonical).is_none());
     }
+
+    /// Firefox's sign-in with an allowList: a silent pre-flight (`up: false` GetAssertion, its
+    /// `do_credential_list_filtering_ctap2`), then the real GetAssertion. With the passage backend
+    /// the passkey is decrypted once for both and dropped when the sign-in ends, so the next
+    /// sign-in asks again.
+    #[test]
+    fn a_passage_sign_in_decrypts_once_and_then_forgets_the_passkey() {
+        use crate::storage::pass::age::{AgeCrypto, decrypt_count, install_counting_fake_age};
+        use crate::storage::pass::{PassStorageAdapter, StoreCrypto};
+
+        let dir = tempfile::tempdir().unwrap();
+        let identities = dir.path().join("identities");
+        std::fs::write(&identities, "fake").unwrap();
+        let log = dir.path().join("decrypts");
+        let fake_age = dir.path().join("age");
+        install_counting_fake_age(&fake_age, &log);
+        let storage = Arc::new(Mutex::new(
+            PassStorageAdapter::new_with_options(
+                dir.path().join("store"),
+                "www".into(),
+                StoreCrypto::Age(AgeCrypto::new(fake_age, identities)),
+                false,
+            )
+            .unwrap(),
+        ));
+        let _prompts = AutoAccept::install();
+        let mut service = AuthenticatorService::<_, (), _>::with_shared_storage(
+            storage,
+            None,
+            security_config(false),
+            PinConfig::default(),
+        )
+        .unwrap();
+        let mut handle = |request: &[u8]| {
+            let mut response = Vec::new();
+            service.handle(request, &mut response).unwrap();
+            decode_success(&response)
+        };
+
+        // A resident registration (rk with credProtect 1): written, nothing decrypted.
+        let attestation = handle(&enroll_request(-7, Some(1)));
+        let auth_data = bytes_at(&attestation, int(2));
+        let id_len = u16::from_be_bytes([auth_data[53], auth_data[54]]) as usize;
+        let id = auth_data[55..55 + id_len].to_vec();
+        assert_eq!(decrypt_count(&log), 0);
+
+        for sign_in in 1..=2 {
+            handle(&sign_request(&[&id], false));
+            assert_eq!(decrypt_count(&log), sign_in, "the pre-flight decrypts");
+            let assertion = handle(&sign_request(&[&id], true));
+            assert_eq!(
+                bytes_at(map_get(&assertion, &int(1)).unwrap(), text("id")),
+                id
+            );
+            assert_eq!(
+                decrypt_count(&log),
+                sign_in,
+                "the real assertion uses the pre-flight's decrypt"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
-mod rp_hint_tests {
-    use super::request_rp_id;
+mod request_scope_tests {
+    use super::RequestScope;
+    use crate::ctap_request::{self, RequestSignals};
 
     use ciborium::Value;
 
@@ -4864,8 +4979,22 @@ mod rp_hint_tests {
         bytes
     }
 
+    fn get_assertion(up: Option<bool>) -> Vec<u8> {
+        let mut params = vec![
+            (Value::Integer(1.into()), Value::Text("webauthn.io".into())),
+            (Value::Integer(2.into()), Value::Bytes(vec![0; 32])),
+        ];
+        if let Some(up) = up {
+            params.push((
+                Value::Integer(5.into()),
+                Value::Map(vec![(Value::Text("up".into()), Value::Bool(up))]),
+            ));
+        }
+        request(0x02, params)
+    }
+
     #[test]
-    fn the_rp_id_of_make_credential_and_get_assertion_is_found() {
+    fn the_rp_id_and_a_silent_pre_flight_are_recognized() {
         let rp = Value::Map(vec![
             (Value::Text("id".into()), Value::Text("github.com".into())),
             (Value::Text("name".into()), Value::Text("GitHub".into())),
@@ -4877,19 +5006,50 @@ mod rp_hint_tests {
                 (Value::Integer(2.into()), rp),
             ],
         );
-        assert_eq!(request_rp_id(&make).as_deref(), Some("github.com"));
+        let scope = RequestScope::parse(&make);
+        assert_eq!(scope.rp_id.as_deref(), Some("github.com"));
+        assert!(!scope.silent_assertion);
 
-        let get = request(
-            0x02,
-            vec![
-                (Value::Integer(1.into()), Value::Text("webauthn.io".into())),
-                (Value::Integer(2.into()), Value::Bytes(vec![0; 32])),
-            ],
+        let silent = RequestScope::parse(&get_assertion(Some(false)));
+        assert_eq!(silent.rp_id.as_deref(), Some("webauthn.io"));
+        assert!(silent.silent_assertion);
+        assert!(!RequestScope::parse(&get_assertion(Some(true))).silent_assertion);
+        assert!(!RequestScope::parse(&get_assertion(None)).silent_assertion);
+
+        assert_eq!(
+            RequestScope::parse(&request(0x04, vec![])),
+            RequestScope::default()
         );
-        assert_eq!(request_rp_id(&get).as_deref(), Some("webauthn.io"));
+        assert_eq!(RequestScope::parse(&[0x02, 0xff]), RequestScope::default());
+        assert_eq!(RequestScope::parse(&[]), RequestScope::default());
+    }
 
-        assert_eq!(request_rp_id(&request(0x04, vec![])), None);
-        assert_eq!(request_rp_id(&[0x02, 0xff]), None);
-        assert_eq!(request_rp_id(&[]), None);
+    /// Decrypted credentials survive from the pre-flight to the real request of one sign-in and
+    /// are dropped when the sign-in ends.
+    #[test]
+    fn decrypted_credentials_span_one_sign_in_only() {
+        let keeps = |request: &[u8]| {
+            RequestScope::parse(request).keeps_decrypted_credentials(request.first().copied())
+        };
+        assert!(keeps(&get_assertion(Some(false))), "the pre-flight");
+        assert!(keeps(&[0x04]), "GetInfo");
+        assert!(
+            keeps(&request(0x06, vec![])),
+            "ClientPIN (getPinUvAuthToken)"
+        );
+        assert!(!keeps(&get_assertion(None)), "the real assertion ends it");
+        assert!(!keeps(&get_assertion(Some(true))));
+        assert!(!keeps(&request(0x01, vec![])), "a registration ends it");
+        assert!(!keeps(&[0x08]), "GetNextAssertion");
+        assert!(!keeps(&[0x0A]), "credential management");
+
+        let signals = RequestSignals::default();
+        ctap_request::serve(&signals, || {
+            signals.cancel();
+            assert!(
+                !keeps(&get_assertion(Some(false))),
+                "a cancelled pre-flight ends it"
+            );
+        });
     }
 }

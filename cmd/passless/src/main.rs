@@ -77,6 +77,7 @@ fn pass_store(backend: &BackendConfig) -> Result<(String, String, StoreCrypto)> 
             path,
             identities_file,
             age_binary,
+            ..
         } => Ok((
             store_path.clone(),
             path.clone(),
@@ -554,6 +555,12 @@ fn run() -> Result<()> {
         BackendConfig::Passage { .. } => (config.passage.git_sync, config.passage.git_auto_push),
         _ => (config.pass.git_sync, config.pass.git_auto_push),
     };
+    let credential_cache_ttl = match &backend {
+        BackendConfig::Passage { cache_ttl, .. } => {
+            Some(std::time::Duration::from_secs((*cache_ttl).into()))
+        }
+        _ => None,
+    };
 
     #[cfg(feature = "agent")]
     let agent_enabled = config.agents.enabled;
@@ -678,7 +685,7 @@ fn run() -> Result<()> {
                         _ => agent::audit_events::BackendKind::Pass,
                     };
                     let (store_path, path, crypto) = pass_store(&backend)?;
-                    let storage = PassStorageAdapter::new_with_options_and_git_sync(
+                    let mut storage = PassStorageAdapter::new_with_options_and_git_sync(
                         store_path.clone().into(),
                         path.clone().into(),
                         crypto.clone(),
@@ -686,6 +693,9 @@ fn run() -> Result<()> {
                         pass_git_sync,
                         pass_git_auto_push,
                     )?;
+                    if let Some(ttl) = credential_cache_ttl {
+                        storage.set_cache_ttl(ttl);
+                    }
                     let pass_sync = storage.sync_handle();
                     let boxed: Box<dyn CredentialStorage> = Box::new(storage);
                     let shared_storage = Arc::new(Mutex::new(boxed));
@@ -885,7 +895,7 @@ fn run() -> Result<()> {
             }
             BackendConfig::Pass { .. } | BackendConfig::Passage { .. } => {
                 let (store_path, path, crypto) = pass_store(&backend)?;
-                let storage = PassStorageAdapter::new_with_options_and_git_sync(
+                let mut storage = PassStorageAdapter::new_with_options_and_git_sync(
                     store_path.clone().into(),
                     path.clone().into(),
                     crypto.clone(),
@@ -893,6 +903,9 @@ fn run() -> Result<()> {
                     pass_git_sync,
                     pass_git_auto_push,
                 )?;
+                if let Some(ttl) = credential_cache_ttl {
+                    storage.set_cache_ttl(ttl);
+                }
                 let pass_sync = storage.sync_handle();
                 let pin_storage = PassPinStorage::new_with_sync(
                     store_path.into(),

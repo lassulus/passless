@@ -229,6 +229,12 @@ impl PassStorageAdapter {
         Ok(adapter)
     }
 
+    /// How long a decrypted credential may stay in memory at most (it is dropped earlier, when
+    /// the sign-in it was decrypted for ends). Replaces the cache, so call it before any read.
+    pub fn set_cache_ttl(&mut self, ttl: std::time::Duration) {
+        self.cache = CredentialCache::with_ttl(ttl);
+    }
+
     /// Get the FIDO path within the password store
     fn get_fido2_path(&self) -> PathBuf {
         self.store_path.join(&self.path)
@@ -1117,6 +1123,10 @@ impl CredentialStorage for PassStorageAdapter {
 
     fn set_rp_hint(&mut self, rp_id: Option<&str>) {
         self.rp_hint = rp_id.map(str::to_owned);
+    }
+
+    fn forget_decrypted_credentials(&mut self) {
+        self.cache.clear();
     }
 
     fn disable_user_verification(&self) -> bool {

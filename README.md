@@ -296,8 +296,11 @@ nearest `.age-recipients` up to the store root, else the identities file itself.
 `git_auto_push` work as for `[pass]`. Isolated agent profiles do not support passage storage yet.
 
 With an age plugin that asks for its hardware on every decrypt (`age-plugin-tpm`,
-`age-plugin-yubikey`), a sign-in costs one approval: the site's passkey. Passless keeps the host
-waiting with CTAPHID keepalives meanwhile. Its PIN retry counters (not secret) are a plain
+`age-plugin-yubikey`), a sign-in costs one approval: the site's passkey. The decrypted passkey is
+kept in memory only from the browser's silent pre-flight to its real request of the same sign-in,
+and at most `cache_ttl` seconds (default 15, `PASSLESS_PASSAGE_CACHE_TTL`); after that it costs
+another approval, never a failed sign-in. Passless keeps the host waiting with CTAPHID keepalives
+meanwhile. Its PIN retry counters (not secret) are a plain
 `<path>/pin_retries.local.json`, kept out of Git; the encrypted `pin_state.age` is written only
 when PIN settings change and decrypted again only when the file changes.
 

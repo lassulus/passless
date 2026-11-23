@@ -199,6 +199,19 @@ pub struct PassageBackendConfig {
     #[default(passage_age_binary())]
     pub age_binary: String,
 
+    /// Longest time in seconds a decrypted passkey stays in memory. It is dropped as soon as the
+    /// sign-in it was decrypted for ends; this bound covers the gap between a browser's silent
+    /// pre-flight and its real request (including a confirmation click). Expiry only costs one
+    /// more decrypt (hardware approval), never a failed sign-in. 0 = never kept.
+    #[arg(
+        long = "passage-cache-ttl",
+        env = "PASSLESS_PASSAGE_CACHE_TTL",
+        value_name = "SECONDS"
+    )]
+    #[serde(default)]
+    #[default(15)]
+    pub cache_ttl: u32,
+
     /// Automatically synchronize passage store Git around Passless operations
     #[arg(
         long = "passage-git-sync",
@@ -614,6 +627,7 @@ pub enum BackendConfig {
         path: String,
         identities_file: String,
         age_binary: String,
+        cache_ttl: u32,
     },
     #[cfg(feature = "tpm")]
     Tpm {
@@ -820,6 +834,7 @@ impl AppConfig {
                 path: self.passage.path.clone(),
                 identities_file: self.passage.identities_file.clone(),
                 age_binary: self.passage.age_binary.clone(),
+                cache_ttl: self.passage.cache_ttl,
             }),
             #[cfg(feature = "tpm")]
             "tpm" => Ok(BackendConfig::Tpm {

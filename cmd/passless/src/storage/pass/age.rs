@@ -296,6 +296,30 @@ pub fn find_nearest_age_recipients(store_root: &Path, start_dir: &Path) -> Resul
     }
 }
 
+/// Install a stand-in for `age` at `path` that "encrypts" by copying the plaintext and appends a
+/// line to `decrypt_log` for every decrypt, so tests can count hardware approvals.
+#[cfg(test)]
+pub(crate) fn install_counting_fake_age(path: &Path, decrypt_log: &Path) {
+    crate::util::install_test_script(
+        path,
+        &format!(
+            "if [ \"$1\" = -d ]; then echo d >> '{}'; exec cat; fi\n\
+             while [ \"$#\" -gt 0 ] && [ \"$1\" != -o ]; do shift; done\n\
+             cat > \"$2\"\n",
+            decrypt_log.display()
+        ),
+    );
+}
+
+/// The number of decrypts an [`install_counting_fake_age`] script ran.
+#[cfg(test)]
+pub(crate) fn decrypt_count(decrypt_log: &Path) -> usize {
+    std::fs::read_to_string(decrypt_log)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +642,63 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("no identity matched"), "{error}");
+    }
+
+    /// A store with one passkey, written and read through a counting fake `age`.
+    fn fake_age_store(dir: &Path) -> (PassStorageAdapter, PathBuf, soft_fido2::Credential) {
+        let identities = dir.join("identities");
+        fs::write(&identities, "fake").unwrap();
+        let log = dir.join("decrypts");
+        let fake = dir.join("age");
+        install_counting_fake_age(&fake, &log);
+        let crypto = AgeCrypto {
+            binary: fake,
+            identities_file: identities,
+            recipients_override: None,
+        };
+        let credential = sample_credential();
+        let mut adapter = open(&dir.join("store"), "www", crypto.clone());
+        adapter.write(credential_ref(&credential)).unwrap();
+        let mut adapter = open(&dir.join("store"), "www", crypto);
+        adapter.set_rp_hint(Some("example.com"));
+        (adapter, log, credential)
+    }
+
+    #[test]
+    fn a_cached_passkey_expires_after_the_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut adapter, log, credential) = fake_age_store(dir.path());
+        adapter.set_cache_ttl(std::time::Duration::from_millis(300));
+
+        adapter.read(&credential.id).unwrap();
+        adapter.read(&credential.id).unwrap();
+        assert_eq!(decrypt_count(&log), 1, "cached within the TTL");
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(adapter.read(&credential.id).unwrap().id, credential.id);
+        assert_eq!(
+            decrypt_count(&log),
+            2,
+            "expired: decrypted again, still found"
+        );
+    }
+
+    #[test]
+    fn forgetting_drops_decrypted_passkeys_and_a_zero_ttl_keeps_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut adapter, log, credential) = fake_age_store(dir.path());
+
+        adapter.read(&credential.id).unwrap();
+        adapter.forget_decrypted_credentials();
+        assert!(adapter.cache.is_empty());
+        adapter.read(&credential.id).unwrap();
+        assert_eq!(decrypt_count(&log), 2);
+
+        adapter.set_cache_ttl(std::time::Duration::ZERO);
+        adapter.read(&credential.id).unwrap();
+        assert!(adapter.cache.is_empty());
+        adapter.read(&credential.id).unwrap();
+        assert_eq!(decrypt_count(&log), 4);
     }
 
     /// The storage calls of one sign-in (soft-fido2's GetAssertion: the allowList lookup by ID,

@@ -166,12 +166,19 @@ pub struct CachedCredential {
 
 pub struct CredentialCache {
     cache: HashMap<PathBuf, CachedCredential>,
+    ttl: Duration,
 }
 
 impl CredentialCache {
     pub fn new() -> Self {
+        Self::with_ttl(CREDENTIAL_CACHE_TTL)
+    }
+
+    /// A cache whose entries expire `ttl` after they are inserted (zero: nothing is kept).
+    pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             cache: HashMap::new(),
+            ttl,
         }
     }
 
@@ -186,15 +193,23 @@ impl CredentialCache {
     }
 
     pub fn insert(&mut self, path: PathBuf, credential: soft_fido2::Credential) {
+        if self.ttl.is_zero() {
+            return;
+        }
         let cached = CachedCredential {
             credential,
-            expires_at: Instant::now() + CREDENTIAL_CACHE_TTL,
+            expires_at: Instant::now() + self.ttl,
         };
         self.cache.insert(path, cached);
-        debug!(
-            "Cached credential (expires in {}s)",
-            CREDENTIAL_CACHE_TTL.as_secs()
-        );
+        debug!("Cached credential (expires in {:?})", self.ttl);
+    }
+
+    /// Drop every cached credential.
+    pub fn clear(&mut self) {
+        if !self.cache.is_empty() {
+            debug!("Dropping {} cached credential(s)", self.cache.len());
+        }
+        self.cache.clear();
     }
 
     pub fn remove(&mut self, path: &Path) {
