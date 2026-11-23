@@ -23,6 +23,7 @@ use soft_fido2::{
     StatusCode, UpResult, UvResult,
 };
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -93,6 +94,21 @@ struct RequestScope {
     /// A GetAssertion with `up: false`: a platform's "pre-flight" that checks which allowList
     /// (or excludeList) credentials the authenticator holds, ahead of the real request.
     silent_assertion: bool,
+    /// A sign-in: a GetAssertion, or a ClientPIN getPinUvAuthTokenUsingUvWithPermissions asking
+    /// for the GetAssertion permission only (how a platform verifies the user before signing in).
+    /// Built-in UV for it follows `security.user_verification_authentication`.
+    sign_in: bool,
+}
+
+/// ClientPIN subcommand getPinUvAuthTokenUsingUvWithPermissions.
+const CLIENT_PIN_UV_TOKEN: u8 = 0x06;
+/// The pinUvAuthToken permission for GetAssertion.
+const GET_ASSERTION_PERMISSION: u8 = 0x02;
+
+thread_local! {
+    /// Whether the CTAP request this thread serves is a sign-in ([`RequestScope::sign_in`]),
+    /// for the built-in UV callback, which soft-fido2 calls with no hint of its purpose.
+    static SERVING_SIGN_IN: Cell<bool> = const { Cell::new(false) };
 }
 
 impl RequestScope {
@@ -105,6 +121,7 @@ impl RequestScope {
         let rp_key = match command {
             CTAP_MAKE_CREDENTIAL => 2,
             CTAP_GET_ASSERTION => 1,
+            CTAP_CLIENT_PIN => 10,
             _ => return Self::default(),
         };
         let Ok(Value::Map(params)) = ciborium::from_reader::<Value, _>(params) else {
@@ -131,9 +148,19 @@ impl RequestScope {
                     .iter()
                     .any(|(k, v)| k.as_text() == Some("up") && v.as_bool() == Some(false))
             });
+        let integer = |key| field(key).and_then(Value::as_integer);
+        let sign_in = match command {
+            CTAP_GET_ASSERTION => true,
+            CTAP_CLIENT_PIN => {
+                integer(2) == Some(CLIENT_PIN_UV_TOKEN.into())
+                    && integer(9) == Some(GET_ASSERTION_PERMISSION.into())
+            }
+            _ => false,
+        };
         Self {
             rp_id,
             silent_assertion,
+            sign_in,
         }
     }
 
@@ -636,6 +663,17 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
                     self.pin_config.enforcement,
                 );
             }
+        }
+
+        // Without a PIN, a sign-in may leave user verification to the storage: with
+        // `user_verification_authentication = false` (set for passage identities that ask for
+        // their hardware on every decrypt) no notification is shown; decrypting the passkey is
+        // the check and fails closed if it is refused. An unreadable PIN state keeps the prompt.
+        let no_pin = !pin_set && (self.pin_storage.is_none() || uv_retries.is_some());
+        if no_pin && SERVING_SIGN_IN.get() && !self.security_config.user_verification_authentication
+        {
+            debug!("Sign-in UV without a prompt (user_verification_authentication=false): {info}");
+            return Ok(UvResult::AcceptedWithUp);
         }
 
         // A policy refusal is not somebody refusing: `Unavailable` fails the request like
@@ -1712,7 +1750,9 @@ impl<
     pub fn handle(&mut self, request: &[u8], response_buffer: &mut Vec<u8>) -> Result<()> {
         let scope = RequestScope::parse(request);
         lock_shared_storage(&self.storage).set_rp_hint(scope.rp_id.as_deref());
+        SERVING_SIGN_IN.set(scope.sign_in);
         let result = self.handle_request(request, response_buffer);
+        SERVING_SIGN_IN.set(false);
         {
             let mut storage = lock_shared_storage(&self.storage);
             storage.set_rp_hint(None);
@@ -3318,6 +3358,74 @@ mod tests {
         let token = platform::token(service, 2, platform::Way::BuiltInUv, CM_PERMISSION, None)
             .expect("built-in UV token");
         send_set_cred_protect(service, ids, level, authorized(&token, ids, level))
+    }
+
+    /// Without a PIN, the built-in UV of a sign-in (a token with the GetAssertion permission
+    /// only, as Firefox asks before signing in) follows `user_verification_authentication`;
+    /// registration (MakeCredential permission) and credential management always ask.
+    #[test]
+    fn sign_in_uv_without_a_pin_follows_user_verification_authentication() {
+        const GA: u8 = soft_fido2::request::Permission::GetAssertion as u8;
+        const MC: u8 = soft_fido2::request::Permission::MakeCredential as u8;
+
+        for (prompt_at_sign_in, permissions, rp_id, expected_prompts, name) in [
+            (
+                false,
+                GA,
+                Some("example.com"),
+                0,
+                "sign-in, prompt disabled",
+            ),
+            (true, GA, Some("example.com"), 1, "sign-in, prompt enabled"),
+            (
+                false,
+                MC | GA,
+                Some("example.com"),
+                1,
+                "registration always asks",
+            ),
+            (
+                true,
+                MC | GA,
+                Some("example.com"),
+                1,
+                "registration, prompt enabled",
+            ),
+            (
+                false,
+                CM_PERMISSION,
+                None,
+                1,
+                "credential management always asks",
+            ),
+        ] {
+            let (mut service, _dir) = cred_protect_service_with(
+                &[],
+                false,
+                SecurityConfig {
+                    user_verification_authentication: prompt_at_sign_in,
+                    ..Default::default()
+                },
+                PinConfig::default(),
+            );
+            let (prompts, log) = ScriptedPrompts::new(Ok(NotificationResult::Accepted));
+            service.set_prompts(prompts);
+
+            platform::token(
+                &mut service,
+                2,
+                platform::Way::BuiltInUv,
+                permissions,
+                rp_id,
+            )
+            .unwrap_or_else(|status| panic!("{name}: token refused with 0x{status:02x}"));
+
+            assert_eq!(
+                log.lock().unwrap().verifications,
+                expected_prompts,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -5009,10 +5117,12 @@ mod request_scope_tests {
         let scope = RequestScope::parse(&make);
         assert_eq!(scope.rp_id.as_deref(), Some("github.com"));
         assert!(!scope.silent_assertion);
+        assert!(!scope.sign_in, "a registration is not a sign-in");
 
         let silent = RequestScope::parse(&get_assertion(Some(false)));
         assert_eq!(silent.rp_id.as_deref(), Some("webauthn.io"));
         assert!(silent.silent_assertion);
+        assert!(silent.sign_in);
         assert!(!RequestScope::parse(&get_assertion(Some(true))).silent_assertion);
         assert!(!RequestScope::parse(&get_assertion(None)).silent_assertion);
 
