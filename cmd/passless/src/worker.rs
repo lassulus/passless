@@ -1,11 +1,24 @@
-use soft_fido2_transport::{CommandHandler, CtapHidHandler, Packet, UhidDevice};
+use crate::ctap_request::{self, RequestSignals};
 
-use std::sync::Arc;
+use soft_fido2_transport::ctaphid::ErrorCode;
+use soft_fido2_transport::{Cmd, CommandHandler, CtapHidHandler, Message, Packet, UhidDevice};
+
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
+
+/// CTAPHID_KEEPALIVE interval while a request runs (CTAP 2.1, 11.2.9.1.5: every 100 ms).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(100);
+/// CTAPHID_KEEPALIVE status: the authenticator is still processing.
+const STATUS_PROCESSING: u8 = 1;
+/// CTAPHID_KEEPALIVE status: the authenticator waits for the user.
+const STATUS_UPNEEDED: u8 = 2;
+/// CTAP2_ERR_KEEPALIVE_CANCEL: the answer to a request the host cancelled.
+const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
 
 #[derive(Debug, Clone)]
 pub enum WorkerError {
@@ -178,13 +191,14 @@ where
 }
 
 fn run_loop<E: HidEndpoint, H: CommandHandler>(
-    mut endpoint: E,
+    endpoint: E,
     mut ctaphid: CtapHidHandler<H>,
     config: &WorkerConfig,
     cancel: &AtomicBool,
     cache_cleanup: &mut dyn FnMut(),
     hooks: &mut WorkerHooks,
 ) -> Result<(), WorkerError> {
+    let endpoint = Mutex::new(endpoint);
     let mut buffer = [0u8; 64];
     let mut last_cache_cleanup = Instant::now();
     let mut draining = false;
@@ -202,12 +216,13 @@ fn run_loop<E: HidEndpoint, H: CommandHandler>(
             last_cache_cleanup = Instant::now();
         }
 
-        match endpoint.read_packet(&mut buffer) {
+        let read = lock_endpoint(&endpoint).read_packet(&mut buffer);
+        match read {
             Ok(Some(_)) => {
                 debug!("Worker received packet from host");
                 let packet = Packet::from_bytes(buffer);
 
-                match ctaphid.process_packet(packet) {
+                match process_with_keepalive(&endpoint, &mut ctaphid, packet) {
                     Ok(response_packets) => {
                         let batch_len = response_packets.len();
                         if batch_len == 0 {
@@ -217,7 +232,9 @@ fn run_loop<E: HidEndpoint, H: CommandHandler>(
 
                         debug!("Worker sending {} response packets", batch_len);
                         for response_packet in &response_packets {
-                            if let Err(e) = endpoint.write_packet(response_packet.as_bytes()) {
+                            let written =
+                                lock_endpoint(&endpoint).write_packet(response_packet.as_bytes());
+                            if let Err(e) = written {
                                 error!("Worker failed to write response packet: {}", e);
                                 if draining {
                                     break 'outer;
@@ -260,6 +277,76 @@ fn run_loop<E: HidEndpoint, H: CommandHandler>(
     cache_cleanup();
     info!("Worker stopped gracefully");
     Ok(())
+}
+
+fn lock_endpoint<E>(endpoint: &Mutex<E>) -> MutexGuard<'_, E> {
+    endpoint
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Process `packet`. When it completes a request that takes a while (a storage decrypt that asks
+/// for a hardware PIN, a confirmation prompt, a Git pull), a helper thread meanwhile sends
+/// CTAPHID_KEEPALIVE every [`KEEPALIVE_INTERVAL`], so the host keeps waiting, and watches for
+/// CTAPHID_CANCEL. A cancelled CBOR request is answered with CTAP2_ERR_KEEPALIVE_CANCEL.
+fn process_with_keepalive<E: HidEndpoint, H: CommandHandler>(
+    endpoint: &Mutex<E>,
+    ctaphid: &mut CtapHidHandler<H>,
+    packet: Packet,
+) -> soft_fido2_transport::Result<Vec<Packet>> {
+    let cid = packet.cid();
+    let signals = RequestSignals::default();
+    let result = std::thread::scope(|scope| {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let helper_signals = signals.clone();
+        scope.spawn(move || keep_alive(endpoint, cid, &helper_signals, &stopped));
+        let result = ctap_request::serve(&signals, || ctaphid.process_packet(packet));
+        // The helper is joined before the response is written, so no keepalive follows it.
+        drop(stop);
+        result
+    })?;
+    let is_cbor = result.first().and_then(Packet::cmd) == Some(Cmd::Cbor);
+    if signals.is_cancelled() && is_cbor {
+        info!("Request cancelled by the host");
+        return Message::new(cid, Cmd::Cbor, vec![CTAP2_ERR_KEEPALIVE_CANCEL], None).to_packets();
+    }
+    Ok(result)
+}
+
+fn keep_alive<E: HidEndpoint>(
+    endpoint: &Mutex<E>,
+    cid: u32,
+    signals: &RequestSignals,
+    stopped: &mpsc::Receiver<()>,
+) {
+    let mut buffer = [0u8; 64];
+    while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(KEEPALIVE_INTERVAL) {
+        let status = if signals.user_prompt_pending() {
+            STATUS_UPNEEDED
+        } else {
+            STATUS_PROCESSING
+        };
+        let mut endpoint = lock_endpoint(endpoint);
+        let keepalive = Message::new(cid, Cmd::Keepalive, vec![status], None).to_packets();
+        if let Some(keepalive) = keepalive.ok().as_ref().and_then(|packets| packets.first())
+            && let Err(e) = endpoint.write_packet(keepalive.as_bytes())
+        {
+            warn!("Failed to send keepalive: {}", e);
+        }
+        // What the host sent meanwhile: CANCEL of this request, else the channel is busy.
+        while let Ok(Some(_)) = endpoint.read_packet(&mut buffer) {
+            let packet = Packet::from_bytes(buffer);
+            if packet.cid() == cid && packet.cmd() == Some(Cmd::Cancel) {
+                debug!("Host cancelled the running request");
+                signals.cancel();
+            } else if packet.is_init() {
+                let busy = Packet::new_error(packet.cid(), ErrorCode::ChannelBusy);
+                if let Err(e) = endpoint.write_packet(busy.as_bytes()) {
+                    warn!("Failed to answer a packet while busy: {}", e);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1032,5 +1119,130 @@ mod tests {
 
         let outbound = endpoint.outbound_packets();
         assert!(!outbound.is_empty(), "expected response packet");
+    }
+
+    /// A request handler that decrypts through `age`, like the passage backend does.
+    struct AgeDecryptHandler(crate::storage::pass::age::AgeCrypto);
+
+    impl CommandHandler for AgeDecryptHandler {
+        fn handle_command(
+            &mut self,
+            _cmd: Cmd,
+            data: &[u8],
+        ) -> soft_fido2_transport::Result<Vec<u8>> {
+            Ok(match self.0.decrypt(data) {
+                Ok(plaintext) => plaintext.to_vec(),
+                Err(_) => vec![0x7F],
+            })
+        }
+    }
+
+    /// Spawn a worker whose requests run a fake `age` with `body`, and send it one request.
+    fn serve_through_fake_age(body: &str) -> (FakeEndpoint, WorkerHandle, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let age = dir.path().join("age");
+        crate::util::install_test_script(&age, body);
+        let endpoint = FakeEndpoint::new();
+        endpoint.push_packet(&make_cbor_packet(0x0bad_cafe, b"ciphertext"));
+        let handle = spawn(
+            endpoint.clone(),
+            CtapHidHandler::new(AgeDecryptHandler(
+                crate::storage::pass::age::AgeCrypto::new(age, dir.path().join("identities")),
+            )),
+            WorkerConfig {
+                poll_interval: Duration::from_millis(1),
+                cache_cleanup_interval: Duration::from_secs(3600),
+            },
+            Arc::new(AtomicBool::new(false)),
+            Box::new(|| {}),
+        );
+        (endpoint, handle, dir)
+    }
+
+    /// The packets sent so far: keepalive statuses and, once there, the CBOR response payload.
+    fn keepalives_and_response(endpoint: &FakeEndpoint) -> (Vec<u8>, Option<Vec<u8>>) {
+        let mut statuses = Vec::new();
+        let mut response = Vec::new();
+        for bytes in endpoint.outbound_packets() {
+            let packet = Packet::from_bytes(bytes);
+            match packet.cmd() {
+                Some(Cmd::Keepalive) => {
+                    assert!(response.is_empty(), "keepalive after the response");
+                    statuses.push(packet.payload()[0]);
+                }
+                _ => response.push(bytes),
+            }
+        }
+        let message = extract_response_message(&response).map(|message| {
+            assert_eq!(message.cmd, Cmd::Cbor);
+            message.data
+        });
+        (statuses, message)
+    }
+
+    fn wait_for_response(endpoint: &FakeEndpoint, limit: Duration) -> (Vec<u8>, Vec<u8>) {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let (statuses, Some(response)) = keepalives_and_response(endpoint) {
+                return (statuses, response);
+            }
+            assert!(Instant::now() < deadline, "no response within {limit:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A decrypt that takes 5 s (an age plugin waiting for a hardware PIN) keeps the host waiting:
+    /// CTAPHID_KEEPALIVE with UPNEEDED every 100 ms, then the response.
+    #[test]
+    fn a_slow_age_decrypt_sends_keepalives_until_the_response() {
+        let started = Instant::now();
+        let (endpoint, handle, _dir) =
+            serve_through_fake_age("cat >/dev/null\nsleep 5\nprintf plaintext\n");
+
+        let (statuses, response) = wait_for_response(&endpoint, Duration::from_secs(15));
+
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert_eq!(response, b"plaintext");
+        assert!(statuses.len() >= 30, "{} keepalives", statuses.len());
+        assert!(
+            statuses.iter().all(|&status| status == STATUS_UPNEEDED),
+            "{statuses:?}"
+        );
+        handle.cancel();
+        assert!(matches!(handle.join(), WorkerOutcome::Clean));
+    }
+
+    /// CTAPHID_CANCEL from the host kills the running `age` and answers the request with
+    /// CTAP2_ERR_KEEPALIVE_CANCEL instead of waiting for it.
+    #[test]
+    fn a_host_cancel_stops_a_slow_age_decrypt() {
+        let started = Instant::now();
+        let (endpoint, handle, _dir) = serve_through_fake_age("cat >/dev/null\nexec sleep 30\n");
+        std::thread::sleep(Duration::from_millis(500));
+        let cancel = Message::new(0x0bad_cafe, Cmd::Cancel, vec![], None)
+            .to_packets()
+            .unwrap();
+        endpoint.push_packet(&cancel[0]);
+
+        let (statuses, response) = wait_for_response(&endpoint, Duration::from_secs(10));
+
+        assert_eq!(response, [CTAP2_ERR_KEEPALIVE_CANCEL]);
+        assert!(!statuses.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        handle.cancel();
+        assert!(matches!(handle.join(), WorkerOutcome::Clean));
+    }
+
+    /// A quick request gets no keepalive.
+    #[test]
+    fn a_quick_request_sends_no_keepalive() {
+        let (endpoint, handle, _dir) = serve_through_fake_age("cat >/dev/null\nprintf ok\n");
+
+        let (statuses, response) = wait_for_response(&endpoint, Duration::from_secs(10));
+
+        assert_eq!(response, b"ok");
+        assert!(statuses.len() <= 1, "{statuses:?}");
+        handle.cancel();
+        assert!(matches!(handle.join(), WorkerOutcome::Clean));
     }
 }

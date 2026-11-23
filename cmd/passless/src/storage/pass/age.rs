@@ -7,13 +7,19 @@
 
 use passless_core::error::{Error, Result};
 
-use std::ffi::OsString;
-use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use crate::ctap_request;
 
-use log::debug;
+use std::ffi::OsString;
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::Duration;
+
+use log::{debug, warn};
 use zeroize::Zeroizing;
+
+/// How often a running `age` is checked for a cancelled CTAP request.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// passage's per-directory recipients file. The nearest one between an entry's directory and the
 /// store root applies.
@@ -118,19 +124,32 @@ impl AgeCrypto {
             command.arg("-e");
             recipients.add_args(&mut command);
             command.arg("-o").arg(tmp_path);
-            self.run(command, plaintext, "encryption").map(drop)
+            // Encrypting to recipients needs no secret; to the identities file (`-i`) an age
+            // plugin may have to ask for its hardware.
+            let may_prompt = matches!(recipients, AgeRecipients::Identities(_));
+            self.run(command, plaintext, "encryption", may_prompt)
+                .map(drop)
         })
     }
 
-    /// Decrypt `ciphertext` with the identities file.
+    /// Decrypt `ciphertext` with the identities file. An age plugin may ask the user (a hardware
+    /// PIN or touch) meanwhile; the running CTAP request reports that to the host.
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let mut command = Command::new(&self.binary);
         command.arg("-d").arg("-i").arg(&self.identities_file);
-        let output = self.run(command, ciphertext, "decryption")?;
-        Ok(Zeroizing::new(output.stdout))
+        self.run(command, ciphertext, "decryption", true)
     }
 
-    fn run(&self, mut command: Command, input: &[u8], action: &str) -> Result<Output> {
+    /// Run `age`, feeding `input`, and return its stdout. The process is killed when the host
+    /// cancels the CTAP request being served.
+    fn run(
+        &self,
+        mut command: Command,
+        input: &[u8],
+        action: &str,
+        may_prompt: bool,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let _prompt = may_prompt.then(ctap_request::user_prompt);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -146,6 +165,8 @@ impl AgeCrypto {
             // age exits early on a bad header or a missing identity; its stderr says why.
             match stdin.write_all(input) {
                 Err(error) if error.kind() != ErrorKind::BrokenPipe => {
+                    let _ = child.kill();
+                    let _ = child.wait();
                     return Err(Error::Storage(format!(
                         "Failed to write to age for {action}: {error}"
                     )));
@@ -153,19 +174,68 @@ impl AgeCrypto {
                 _ => {}
             }
         }
-        let output = child
-            .wait_with_output()
+        let finished = wait_cancellable(&mut child)
             .map_err(|error| Error::Storage(format!("Failed to wait for age {action}: {error}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(Finished {
+            status,
+            stdout,
+            stderr,
+        }) = finished
+        else {
+            warn!("age {action} killed: the host cancelled the request");
+            return Err(Error::Storage(format!(
+                "age {action} cancelled by the host"
+            )));
+        };
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr);
             debug!("age {action} failed: {}", stderr.trim());
             return Err(Error::Storage(format!(
                 "age {action} failed ({}): {}",
-                output.status,
+                status,
                 stderr.trim()
             )));
         }
-        Ok(output)
+        Ok(stdout)
+    }
+}
+
+/// A process that exited, with its output.
+struct Finished {
+    status: ExitStatus,
+    stdout: Zeroizing<Vec<u8>>,
+    stderr: Vec<u8>,
+}
+
+/// Wait for `child` while collecting its output. `None`: the CTAP request was cancelled and the
+/// process killed. Its output readers are then left to finish on their own: a process the child
+/// started (a PIN prompt in an `age` wrapper) may still hold the pipes.
+fn wait_cancellable(child: &mut Child) -> std::io::Result<Option<Finished>> {
+    fn read_all(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buffer);
+            }
+            buffer
+        })
+    }
+    let out = read_all(child.stdout.take());
+    let err = read_all(child.stderr.take());
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(Finished {
+                status,
+                stdout: Zeroizing::new(out.join().unwrap_or_default()),
+                stderr: err.join().unwrap_or_default(),
+            }));
+        }
+        if ctap_request::cancelled() {
+            let _ = child.kill();
+            child.wait()?;
+            return Ok(None);
+        }
+        std::thread::sleep(CANCEL_POLL_INTERVAL);
     }
 }
 

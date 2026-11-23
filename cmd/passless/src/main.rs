@@ -4,6 +4,7 @@ mod authenticator;
 mod commands;
 mod credential_backup;
 mod credential_protection;
+mod ctap_request;
 mod human_prompts;
 mod instance_lock;
 mod logging;

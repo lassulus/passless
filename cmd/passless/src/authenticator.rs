@@ -522,6 +522,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             return Ok(UpResult::Accepted);
         }
 
+        let _prompt = crate::ctap_request::user_prompt();
         let answer = lock_prompts(&self.prompts).user_presence(
             info,
             Some(rp),
@@ -616,6 +617,7 @@ impl<S: CredentialStorage, P: PinStorage> AuthenticatorCallbacks for PasslessCal
             }
         }
 
+        let _prompt = crate::ctap_request::user_prompt();
         let answer = lock_prompts(&self.prompts).user_verification(
             info,
             Some(rp),
@@ -1620,6 +1622,7 @@ impl<
             return Ok(());
         }
 
+        let _prompt = crate::ctap_request::user_prompt();
         let mut prompts = lock_prompts(&self.prompts);
         match prompts.interaction_is_automatic() {
             Ok(false) => {}

@@ -268,6 +268,39 @@ pub fn create_secure_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
     Ok(())
 }
 
+/// Install an executable `/bin/sh` script with `body` at `path`, for tests that run a fake tool.
+///
+/// Tests run on parallel threads of one process: another thread's `fork` can briefly inherit the
+/// write descriptor, and `exec` of the script then fails with ETXTBSY. The script answers a probe
+/// argument at once, and this returns only after a probe run started.
+#[cfg(test)]
+pub(crate) fn install_test_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    const PROBE_ARG: &str = "--passless-test-probe";
+    const ETXTBSY: i32 = 26;
+
+    let script = format!("#!/bin/sh\n[ \"$1\" = '{PROBE_ARG}' ] && exit 0\n{body}");
+    fs::write(path, script).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match std::process::Command::new(path).arg(PROBE_ARG).status() {
+            Ok(status) => {
+                assert!(status.success(), "test script probe failed: {status}");
+                return;
+            }
+            Err(error)
+                if error.raw_os_error() == Some(ETXTBSY)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => panic!("failed to probe test script: {error}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
