@@ -300,8 +300,8 @@ pub fn find_nearest_age_recipients(store_root: &Path, start_dir: &Path) -> Resul
 mod tests {
     use super::*;
 
-    use crate::storage::CredentialStorage;
     use crate::storage::pass::{PassStorageAdapter, StoreCrypto};
+    use crate::storage::{CredentialFilter, CredentialStorage};
 
     use std::fs;
 
@@ -618,6 +618,60 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("no identity matched"), "{error}");
+    }
+
+    /// The storage calls of one sign-in (soft-fido2's GetAssertion: the allowList lookup by ID,
+    /// the discoverable lookup by RP, the sign-counter write, reads for credProtect) decrypt the
+    /// site's single passkey once, and nothing else in the site's folder.
+    #[test]
+    #[ignore = "requires the age and age-keygen binaries"]
+    fn a_sign_in_decrypts_the_passkey_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let site = store.join("www/example.com");
+        fs::create_dir_all(&site).unwrap();
+        let identities = dir.path().join("identities");
+        let recipient = age_keygen(&identities);
+        fs::write(store.join(AGE_RECIPIENTS_FILE), format!("{recipient}\n")).unwrap();
+        let credential = sample_credential();
+        open(&store, "www", crypto(&identities))
+            .write(credential_ref(&credential))
+            .unwrap();
+        fs::write(site.join("user.age"), b"not even age").unwrap();
+
+        let decrypts = dir.path().join("decrypts");
+        let counting_age = dir.path().join("age");
+        crate::util::install_test_script(
+            &counting_age,
+            &format!(
+                "[ \"$1\" = -d ] && echo d >> '{}'\nexec age \"$@\"\n",
+                decrypts.display()
+            ),
+        );
+        let mut adapter = open(
+            &store,
+            "www",
+            AgeCrypto {
+                binary: counting_age,
+                identities_file: identities,
+                recipients_override: None,
+            },
+        );
+        assert!(!decrypts.exists(), "opening the store decrypts nothing");
+
+        adapter.set_rp_hint(Some("example.com"));
+        let found = adapter.read(&credential.id).unwrap();
+        adapter
+            .read_first(CredentialFilter::ByRp("example.com".into()))
+            .unwrap();
+        let mut used = found.clone();
+        used.sign_count += 1;
+        adapter.write(credential_ref(&used)).unwrap();
+        assert_eq!(adapter.read(&credential.id).unwrap().sign_count, 8);
+        adapter.set_rp_hint(None);
+
+        let count = fs::read_to_string(&decrypts).unwrap().lines().count();
+        assert_eq!(count, 1, "one decrypt for the whole sign-in");
     }
 
     /// An empty or `.` passkey root keeps the site folders directly in the store root.

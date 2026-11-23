@@ -7,11 +7,13 @@ use crate::storage::pass::StoreCrypto;
 use crate::storage::pass::gpg_id;
 use crate::storage::pass::layout::ensure_entry_dir;
 use crate::storage::pass::sync::PassGitSync;
+use crate::util::atomic_write_in_dir;
 
 use passless_core::error::{Error, Result};
 
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::time::SystemTime;
 
 use log::{debug, info, warn};
 use prs_lib::crypto::IsContext;
@@ -21,6 +23,8 @@ use zeroize::Zeroizing;
 const PIN_CONFIG_ENTRY: &str = "pin_state";
 const PIN_RETRIES_ENTRY: &str = "pin_retries.local";
 const LEGACY_PIN_RETRIES_ENTRY: &str = "pin_retries";
+/// passage: the PIN retry counters, plain JSON (see [`PassPinStorage`]).
+const PLAIN_PIN_RETRIES_FILE: &str = "pin_retries.local.json";
 
 /// Tracked state for conflict detection
 #[derive(Debug, Clone)]
@@ -33,10 +37,13 @@ struct SyncedConfig {
 
 /// Pass (password-store) PIN storage
 ///
-/// Stores PIN state as two encrypted entries in the password store (`.age` instead of `.gpg` for
-/// passage):
-/// - `pin_state.gpg`: PIN config (hash, min length, version) - synced to git
-/// - `pin_retries.local.gpg`: Retry counters (retries, uv_retries, locked_until) - local only
+/// Stores PIN state as two entries in the password store:
+/// - `pin_state.gpg` (`.age` for passage): PIN config (hash, min length, version), encrypted,
+///   synced to git
+/// - `pin_retries.local.gpg`: Retry counters (retries, uv_retries, locked_until), local only. For
+///   passage it is the plain `pin_retries.local.json`: the counters are not secret, and reading
+///   an age entry can cost a hardware approval (age plugins) on every request. Encryption to the
+///   store's public recipients gives them no integrity either, so nothing is lost.
 pub struct PassPinStorage {
     store_path: PathBuf,
     fido2_path: PathBuf,
@@ -44,6 +51,9 @@ pub struct PassPinStorage {
     sync: PassGitSync,
     /// Last known config state for change detection (for git sync optimization)
     last_config: RwLock<Option<SerializablePinConfig>>,
+    /// Size and modification time of the config entry `last_config` was read from or written to:
+    /// while the file is unchanged it is not decrypted again.
+    config_stamp: RwLock<Option<(u64, SystemTime)>>,
     /// Last synced config state for conflict detection
     last_synced: RwLock<Option<SyncedConfig>>,
 }
@@ -67,6 +77,7 @@ impl PassPinStorage {
             crypto,
             sync,
             last_config: RwLock::new(None),
+            config_stamp: RwLock::new(None),
             last_synced: RwLock::new(None),
         };
         storage
@@ -88,7 +99,25 @@ impl PassPinStorage {
     }
 
     fn get_retries_path(&self) -> PathBuf {
-        self.entry_path(PIN_RETRIES_ENTRY)
+        match self.crypto {
+            StoreCrypto::Gpg(_) => self.entry_path(PIN_RETRIES_ENTRY),
+            StoreCrypto::Age(_) => self
+                .store_path
+                .join(&self.fido2_path)
+                .join(PLAIN_PIN_RETRIES_FILE),
+        }
+    }
+
+    /// The size and modification time of `path`, to tell whether it changed.
+    fn file_stamp(path: &Path) -> Option<(u64, SystemTime)> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.len(), metadata.modified().ok()?))
+    }
+
+    fn remember_config_stamp(&self, stamp: Option<(u64, SystemTime)>) {
+        if let Ok(mut current) = self.config_stamp.write() {
+            *current = stamp;
+        }
     }
 
     fn get_legacy_retries_path(&self) -> PathBuf {
@@ -143,6 +172,17 @@ impl PassPinStorage {
             return Ok(SerializablePinConfig::default());
         }
 
+        // An unchanged entry is not decrypted again: its content is `last_config` already.
+        let stamp = Self::file_stamp(&path);
+        let unchanged = stamp.is_some() && self.config_stamp.read().is_ok_and(|s| *s == stamp);
+        if unchanged
+            && let Ok(last) = self.last_config.read()
+            && let Some(config) = last.as_ref()
+        {
+            debug!("PIN config entry unchanged, not decrypting it again");
+            return Ok(config.clone());
+        }
+
         let encrypted_data = std::fs::read(&path).map_err(|e| {
             warn!("Failed to read PIN config entry: {}", e);
             soft_fido2::StatusCode::Other
@@ -152,6 +192,7 @@ impl PassPinStorage {
             warn!("Failed to decrypt PIN config: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
+        self.remember_config_stamp(stamp);
 
         SerializablePinConfig::from_json_bytes(&plaintext).map_err(|e| {
             warn!("Failed to parse PIN config: {:?}", e);
@@ -164,9 +205,10 @@ impl PassPinStorage {
 
         let local_path = self.get_retries_path();
         let legacy_path = self.get_legacy_retries_path();
+        let gpg = matches!(self.crypto, StoreCrypto::Gpg(_));
         let path = if local_path.exists() {
             local_path
-        } else if legacy_path.exists() {
+        } else if gpg && legacy_path.exists() {
             debug!("Loading legacy PIN retries; next save will migrate them to local-only storage");
             legacy_path
         } else {
@@ -179,10 +221,13 @@ impl PassPinStorage {
             soft_fido2::StatusCode::Other
         })?;
 
-        let plaintext = self.decrypt_entry(encrypted_data).map_err(|e| {
-            warn!("Failed to decrypt PIN retries: {:?}", e);
-            soft_fido2::StatusCode::Other
-        })?;
+        let plaintext = match self.crypto {
+            StoreCrypto::Gpg(_) => self.decrypt_entry(encrypted_data).map_err(|e| {
+                warn!("Failed to decrypt PIN retries: {:?}", e);
+                soft_fido2::StatusCode::Other
+            })?,
+            StoreCrypto::Age(_) => Zeroizing::new(encrypted_data),
+        };
 
         SerializablePinRetries::from_json_bytes(&plaintext).map_err(|e| {
             warn!("Failed to parse PIN retries: {:?}", e);
@@ -204,6 +249,7 @@ impl PassPinStorage {
             warn!("Failed to encrypt PIN config: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
+        self.remember_config_stamp(Self::file_stamp(&path));
 
         self.sync.mark_dirty("Update Passless PIN configuration.");
 
@@ -224,8 +270,14 @@ impl PassPinStorage {
         let bytes = retries.to_json_bytes()?;
 
         let path = self.get_retries_path();
-        self.encrypt_entry(&path, bytes).map_err(|e| {
-            warn!("Failed to encrypt PIN retries: {:?}", e);
+        let written = match (&self.crypto, path.parent()) {
+            (StoreCrypto::Age(_), Some(dir)) => ensure_entry_dir(&self.crypto, dir)
+                .and_then(|()| atomic_write_in_dir(dir, PLAIN_PIN_RETRIES_FILE, &bytes))
+                .map_err(|e| Error::Storage(e.to_string())),
+            _ => self.encrypt_entry(&path, bytes),
+        };
+        written.map_err(|e| {
+            warn!("Failed to save PIN retries: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
 
@@ -514,6 +566,45 @@ mod tests {
         assert!(storage.config_changed(&retry_only));
     }
 
+    fn age_storage(store: &Path, age_binary: &Path, identities: &Path) -> PassPinStorage {
+        PassPinStorage::new_with_sync(
+            store.to_path_buf(),
+            PathBuf::from("fido2"),
+            StoreCrypto::Age(crate::storage::pass::age::AgeCrypto::new(
+                age_binary.to_path_buf(),
+                identities.to_path_buf(),
+            )),
+            PassGitSync::new(store.to_path_buf(), false, false),
+        )
+    }
+
+    /// passage without a PIN: loading and saving the PIN state (daemon start, every request)
+    /// never runs `age`, so an age plugin never asks for its hardware.
+    #[test]
+    fn without_a_pin_passage_pin_state_needs_no_age_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let no_age = temp.path().join("no-such-age");
+        let storage = age_storage(&store, &no_age, &temp.path().join("identities"));
+
+        let mut state = storage.load_pin_state().unwrap();
+        assert!(state.pin_hash.is_none());
+        state.uv_retries = 5;
+        storage.save_pin_state(&state).unwrap();
+
+        let retries = store.join("fido2").join(PLAIN_PIN_RETRIES_FILE);
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&retries).unwrap()).unwrap();
+        assert_eq!(json["uv_retries"], 5);
+        assert!(!store.join("fido2/pin_state.age").exists());
+        assert!(!store.join("fido2/pin_retries.local.age").exists());
+
+        let reloaded = age_storage(&store, &no_age, &temp.path().join("identities"));
+        assert_eq!(reloaded.load_pin_state().unwrap().uv_retries, 5);
+        assert!(!reloaded.is_pin_configured().unwrap());
+    }
+
+    /// With a PIN set, the encrypted PIN config is decrypted once, not again on every request.
     #[test]
     #[ignore = "requires the age and age-keygen binaries"]
     fn pin_configuration_round_trips_through_age() {
@@ -526,21 +617,32 @@ mod tests {
             .unwrap();
         assert!(keygen.status.success());
         let store = temp.path().join("store");
-        let storage = || {
-            PassPinStorage::new_with_sync(
-                store.clone(),
-                PathBuf::from("fido2"),
-                StoreCrypto::Age(crate::storage::pass::age::AgeCrypto::new(
-                    PathBuf::from("age"),
-                    identities.clone(),
-                )),
-                PassGitSync::new(store.clone(), false, false),
-            )
+        let decrypts = temp.path().join("decrypts");
+        let counting_age = temp.path().join("age");
+        crate::util::install_test_script(
+            &counting_age,
+            &format!(
+                "[ \"$1\" = -d ] && echo d >> '{}'\nexec age \"$@\"\n",
+                decrypts.display()
+            ),
+        );
+        let count = || {
+            std::fs::read_to_string(&decrypts)
+                .unwrap_or_default()
+                .lines()
+                .count()
         };
 
-        storage().save_config(&config()).unwrap();
-
+        age_storage(&store, &counting_age, &identities)
+            .save_config(&config())
+            .unwrap();
         assert!(store.join("fido2/pin_state.age").is_file());
-        assert_eq!(storage().load_config().unwrap().pin_hash, config().pin_hash);
+        assert_eq!(count(), 0, "writing needs no decrypt");
+
+        let storage = age_storage(&store, &counting_age, &identities);
+        for _ in 0..3 {
+            assert!(storage.load_pin_state().unwrap().pin_hash.is_some());
+        }
+        assert_eq!(count(), 1, "an unchanged PIN config is decrypted once");
     }
 }

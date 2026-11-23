@@ -295,6 +295,12 @@ Recipients follow passage: `$PASSAGE_RECIPIENTS_FILE`, else `$PASSAGE_RECIPIENTS
 nearest `.age-recipients` up to the store root, else the identities file itself. `git_sync` and
 `git_auto_push` work as for `[pass]`. Isolated agent profiles do not support passage storage yet.
 
+With an age plugin that asks for its hardware on every decrypt (`age-plugin-tpm`,
+`age-plugin-yubikey`), a sign-in costs one approval: the site's passkey. Passless keeps the host
+waiting with CTAPHID keepalives meanwhile. Its PIN retry counters (not secret) are a plain
+`<path>/pin_retries.local.json`, kept out of Git; the encrypted `pin_state.age` is written only
+when PIN settings change and decrypted again only when the file changes.
+
 ### Headless automatic interaction
 
 By default, Passless uses the desktop notification service when a WebAuthn operation needs local

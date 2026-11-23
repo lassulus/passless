@@ -504,8 +504,11 @@ impl PassStorageAdapter {
 
         debug!("Successfully wrote and encrypted credential");
 
-        // Invalidate cache entry for this credential to ensure fresh reads
+        // The file now holds `cred`: cache that, so a read in the same operation (the sign
+        // counter update of a GetAssertion) needs no second decrypt.
         self.cache.remove(&path);
+        self.cache.evict_oldest_if_full();
+        self.cache.insert(path.clone(), cred.clone());
 
         // Update all indexes using shared function
         update_indexes_on_write(&mut self.index.known, path_info);
