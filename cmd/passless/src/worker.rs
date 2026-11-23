@@ -1130,10 +1130,13 @@ mod tests {
             _cmd: Cmd,
             data: &[u8],
         ) -> soft_fido2_transport::Result<Vec<u8>> {
-            Ok(match self.0.decrypt(data) {
-                Ok(plaintext) => plaintext.to_vec(),
-                Err(_) => vec![0x7F],
-            })
+            let entry = std::path::Path::new("/store/www/example.com/passkey.age");
+            Ok(
+                match self.0.decrypt(std::path::Path::new("/store"), entry, data) {
+                    Ok(plaintext) => plaintext.to_vec(),
+                    Err(_) => vec![0x7F],
+                },
+            )
         }
     }
 

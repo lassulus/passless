@@ -132,7 +132,7 @@ impl PassPinStorage {
         })
     }
 
-    fn decrypt_entry(&self, encrypted_data: Vec<u8>) -> Result<Zeroizing<Vec<u8>>> {
+    fn decrypt_entry(&self, path: &Path, encrypted_data: Vec<u8>) -> Result<Zeroizing<Vec<u8>>> {
         match &self.crypto {
             StoreCrypto::Gpg(_) => {
                 let mut context = self.create_crypto_context()?;
@@ -141,7 +141,7 @@ impl PassPinStorage {
                     .map_err(|e| Error::Storage(format!("{:?}", e)))?;
                 Ok(Zeroizing::new(plaintext.unsecure_ref().to_vec()))
             }
-            StoreCrypto::Age(age) => age.decrypt(&encrypted_data),
+            StoreCrypto::Age(age) => age.decrypt(&self.store_path, path, &encrypted_data),
         }
     }
 
@@ -188,7 +188,7 @@ impl PassPinStorage {
             soft_fido2::StatusCode::Other
         })?;
 
-        let plaintext = self.decrypt_entry(encrypted_data).map_err(|e| {
+        let plaintext = self.decrypt_entry(&path, encrypted_data).map_err(|e| {
             warn!("Failed to decrypt PIN config: {:?}", e);
             soft_fido2::StatusCode::Other
         })?;
@@ -222,7 +222,7 @@ impl PassPinStorage {
         })?;
 
         let plaintext = match self.crypto {
-            StoreCrypto::Gpg(_) => self.decrypt_entry(encrypted_data).map_err(|e| {
+            StoreCrypto::Gpg(_) => self.decrypt_entry(&path, encrypted_data).map_err(|e| {
                 warn!("Failed to decrypt PIN retries: {:?}", e);
                 soft_fido2::StatusCode::Other
             })?,
@@ -644,5 +644,28 @@ mod tests {
             assert!(storage.load_pin_state().unwrap().pin_hash.is_some());
         }
         assert_eq!(count(), 1, "an unchanged PIN config is decrypted once");
+    }
+
+    /// The encrypted PIN config's `age` runs name it in `PASSLESS_AGE_TARGET`.
+    #[test]
+    fn pin_config_age_runs_see_their_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let log = temp.path().join("seen");
+        let fake = temp.path().join("age");
+        crate::storage::pass::age::install_target_logging_fake_age(&fake, &log);
+        let identities = temp.path().join("identities");
+
+        age_storage(&store, &fake, &identities)
+            .save_config(&config())
+            .unwrap();
+        age_storage(&store, &fake, &identities)
+            .load_config()
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "-e fido2/pin_state\n-d fido2/pin_state\n"
+        );
     }
 }

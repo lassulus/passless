@@ -28,6 +28,28 @@ pub const AGE_RECIPIENTS_FILE: &str = ".age-recipients";
 const PASSAGE_RECIPIENTS_FILE_ENV: &str = "PASSAGE_RECIPIENTS_FILE";
 const PASSAGE_RECIPIENTS_ENV: &str = "PASSAGE_RECIPIENTS";
 
+/// Set for every `age` run: the store entry it reads or writes, as passage names it
+/// (`www/github.com/passkey`), so an age wrapper's PIN prompt can say what is decrypted.
+const TARGET_ENV: &str = "PASSLESS_AGE_TARGET";
+
+/// The passage name of the entry at `path` in the store at `store_root`: the store-relative path
+/// without `.age`.
+fn entry_name(store_root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(store_root).unwrap_or(path);
+    let name = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    match name.strip_suffix(".age") {
+        Some(entry) => entry.to_string(),
+        None => name,
+    }
+}
+
 /// age encryption of passage store entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgeCrypto {
@@ -119,9 +141,10 @@ impl AgeCrypto {
         output_path: &Path,
     ) -> Result<()> {
         let recipients = self.recipients_for(store_root, output_path)?;
+        let target = entry_name(store_root, output_path);
         super::write_atomically(output_path, |tmp_path| {
             let mut command = Command::new(&self.binary);
-            command.arg("-e");
+            command.env(TARGET_ENV, &target).arg("-e");
             recipients.add_args(&mut command);
             command.arg("-o").arg(tmp_path);
             // Encrypting to recipients needs no secret; to the identities file (`-i`) an age
@@ -132,11 +155,21 @@ impl AgeCrypto {
         })
     }
 
-    /// Decrypt `ciphertext` with the identities file. An age plugin may ask the user (a hardware
-    /// PIN or touch) meanwhile; the running CTAP request reports that to the host.
-    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    /// Decrypt `ciphertext`, the content of `path` in the store at `store_root`, with the
+    /// identities file. An age plugin may ask the user (a hardware PIN or touch) meanwhile; the
+    /// running CTAP request reports that to the host.
+    pub fn decrypt(
+        &self,
+        store_root: &Path,
+        path: &Path,
+        ciphertext: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
         let mut command = Command::new(&self.binary);
-        command.arg("-d").arg("-i").arg(&self.identities_file);
+        command
+            .env(TARGET_ENV, entry_name(store_root, path))
+            .arg("-d")
+            .arg("-i")
+            .arg(&self.identities_file);
         self.run(command, ciphertext, "decryption", true)
     }
 
@@ -307,6 +340,21 @@ pub(crate) fn install_counting_fake_age(path: &Path, decrypt_log: &Path) {
              while [ \"$#\" -gt 0 ] && [ \"$1\" != -o ]; do shift; done\n\
              cat > \"$2\"\n",
             decrypt_log.display()
+        ),
+    );
+}
+
+/// Like [`install_counting_fake_age`], but logs `<-d|-e> $PASSLESS_AGE_TARGET` for every run.
+#[cfg(test)]
+pub(crate) fn install_target_logging_fake_age(path: &Path, log: &Path) {
+    crate::util::install_test_script(
+        path,
+        &format!(
+            "printf '%s %s\\n' \"$1\" \"$PASSLESS_AGE_TARGET\" >> '{}'\n\
+             if [ \"$1\" = -d ]; then exec cat; fi\n\
+             while [ \"$#\" -gt 0 ] && [ \"$1\" != -o ]; do shift; done\n\
+             cat > \"$2\"\n",
+            log.display()
         ),
     );
 }
@@ -638,7 +686,11 @@ mod tests {
         let mut wrong = open(&store, "www", crypto(&other));
         assert!(wrong.read(&second.id).is_err());
         let error = crypto(&other)
-            .decrypt(&fs::read(site.join("passkey-a1b2c3d4.age")).unwrap())
+            .decrypt(
+                &store,
+                &site.join("passkey-a1b2c3d4.age"),
+                &fs::read(site.join("passkey-a1b2c3d4.age")).unwrap(),
+            )
             .unwrap_err()
             .to_string();
         assert!(error.contains("no identity matched"), "{error}");
@@ -793,8 +845,70 @@ mod tests {
         age.encrypt_file(dir.path(), b"secret", &target).unwrap();
 
         assert_eq!(
-            age.decrypt(&fs::read(&target).unwrap()).unwrap().as_slice(),
+            age.decrypt(dir.path(), &target, &fs::read(&target).unwrap())
+                .unwrap()
+                .as_slice(),
             b"secret"
+        );
+    }
+
+    #[test]
+    fn entry_names_are_store_relative_without_extension() {
+        let store = Path::new("/home/lass/.passage/store");
+        for (path, name) in [
+            ("www/github.com/passkey.age", "www/github.com/passkey"),
+            (
+                "www/github.com/passkey-1a2b3c4d.age",
+                "www/github.com/passkey-1a2b3c4d",
+            ),
+            ("www/pin_state.age", "www/pin_state"),
+            ("./example.com/passkey.age", "example.com/passkey"),
+        ] {
+            assert_eq!(entry_name(store, &store.join(path)), name, "{path}");
+        }
+    }
+
+    /// Every `age` run sees the entry it works on in `PASSLESS_AGE_TARGET`, so a PIN prompt in an
+    /// age wrapper can name it; the ciphertext still comes on stdin.
+    #[test]
+    fn age_runs_see_their_entry_in_passless_age_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let identities = dir.path().join("identities");
+        fs::write(&identities, "fake").unwrap();
+        let seen = dir.path().join("seen");
+        let fake = dir.path().join("age");
+        install_target_logging_fake_age(&fake, &seen);
+        let crypto = AgeCrypto {
+            binary: fake,
+            identities_file: identities,
+            recipients_override: None,
+        };
+        let store = dir.path().join("store");
+        let mut first = sample_credential();
+        let mut second = sample_credential();
+        second.id = vec![0x1a, 0x2b, 0x3c, 0x4d, 0x5e];
+        let mut adapter = open(&store, "www", crypto.clone());
+        adapter.write(credential_ref(&first)).unwrap();
+        adapter.write(credential_ref(&second)).unwrap();
+        let mut reopened = open(&store, "www", crypto);
+        reopened.set_rp_hint(Some("example.com"));
+        reopened.read(&second.id).unwrap();
+        first.sign_count += 1;
+        reopened.write(credential_ref(&first)).unwrap();
+
+        let seen = fs::read_to_string(&seen).unwrap();
+        let mut seen: Vec<_> = seen.lines().collect();
+        // The site's passkeys are decrypted in directory order.
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            [
+                "-d www/example.com/passkey",
+                "-d www/example.com/passkey-1a2b3c4d",
+                "-e www/example.com/passkey",
+                "-e www/example.com/passkey",
+                "-e www/example.com/passkey-1a2b3c4d",
+            ]
         );
     }
 }

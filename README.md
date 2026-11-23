@@ -302,7 +302,9 @@ and at most `cache_ttl` seconds (default 15, `PASSLESS_PASSAGE_CACHE_TTL`); afte
 another approval, never a failed sign-in. Passless keeps the host waiting with CTAPHID keepalives
 meanwhile. Its PIN retry counters (not secret) are a plain
 `<path>/pin_retries.local.json`, kept out of Git; the encrypted `pin_state.age` is written only
-when PIN settings change and decrypted again only when the file changes.
+when PIN settings change and decrypted again only when the file changes. Each `age` run gets the
+entry it reads or writes in `PASSLESS_AGE_TARGET` (e.g. `www/github.com/passkey`), so an `age`
+wrapper's PIN prompt can name it; the data itself still goes through stdin.
 
 ### Headless automatic interaction
 

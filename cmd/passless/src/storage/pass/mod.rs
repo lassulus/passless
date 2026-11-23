@@ -381,9 +381,11 @@ impl PassStorageAdapter {
                 })?;
                 Zeroizing::new(plaintext.unsecure_ref().to_vec())
             }
-            StoreCrypto::Age(age) => age.decrypt(&encrypted_data).inspect_err(|e| {
-                error!("Failed to decrypt credential: {:?}", e);
-            })?,
+            StoreCrypto::Age(age) => age
+                .decrypt(&self.store_path, path, &encrypted_data)
+                .inspect_err(|e| {
+                    error!("Failed to decrypt credential: {:?}", e);
+                })?,
         };
 
         debug!("Successfully decrypted credential");
